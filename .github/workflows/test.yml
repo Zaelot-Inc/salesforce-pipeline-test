@@ -65,7 +65,7 @@ jobs:
 
             # Authenticate to Integration Org
             - name: 'Authenticate to Integration Org'
-              run: sf org login jwt --username "${{ secrets.SF_JWT_USERNAME }}" --jwt-key-file ./SFDX_INTEGRATION_JWT.txt --client-id "${{ secrets.SF_JWT_CLIENT }}" --instance-url https://test.salesforce.com --json 
+              run: sf org login jwt --username "${{ secrets.SF_JWT_USERNAME }}" --jwt-key-file ./SFDX_INTEGRATION_JWT.txt --client-id "${{ secrets.SF_JWT_CLIENT }}" --instance-url https://test.salesforce.com --json --set-default
 
             # Deploy source to Integration org
             - name: 'Deploy the entire branch to Integration org'
