@@ -49,9 +49,9 @@ jobs:
             - name: 'Populate auth file with SFDX_URL secret of the integration and staging orgs'
               shell: bash
               run: |
-                  echo ${{ secrets.SF_JWT_KEY}} > ./SFDX_INTEGRATION_JWT.txt
-                  echo ${{ secrets.SF_JWT_CLIENT}} > ./SFDX_INTEGRATION_JWT_CLIENT.txt
-                  echo ${{ secrets.SF_JWT_USERNAME}} > ./SFDX_INTEGRATION_JWT_USERNAME.txt
+                   printf "%s" "${{ secrets.SF_JWT_KEY }}" > ./SFDX_INTEGRATION_JWT.txt
+                   printf "%s" "${{ secrets.SF_JWT_CLIENT }}" > ./SFDX_INTEGRATION_JWT_CLIENT.txt
+                   printf "%s" "${{ secrets.SF_JWT_USERNAME }}" > ./SFDX_INTEGRATION_JWT_USERNAME.txt
             # Create delta packages for new, modified, or deleted metadata
             - name: 'Create delta packages for new, modified or deleted metadata'
               run: |
@@ -65,7 +65,7 @@ jobs:
 
             # Authenticate to Integration Org
             - name: 'Authenticate to Integration Org'
-              run: sf org login jwt --username ./SFDX_INTEGRATION_JWT_CLIENT.txt --jwt-key-file ${{ secrets.SF_JWT_KEY}} --client-id ./SFDX_INTEGRATION_JWT_CLIENT.txt --instance-url https://test.salesforce.com --json 
+              run: sf org login jwt --username "${{ secrets.SF_JWT_USERNAME }}" --jwt-key-file ./SFDX_INTEGRATION_JWT.txt --client-id "${{ secrets.SF_JWT_CLIENT }}" --instance-url https://test.salesforce.com --json 
 
             # Deploy source to Integration org
             - name: 'Deploy the entire branch to Integration org'
