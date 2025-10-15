@@ -1,0 +1,98 @@
+# Unique name for this workflow
+name: Deploy integration branch to integration and staging/uat orgs
+
+# Definition when the workflow should run
+on:
+    push:
+      branches: [ integration ]
+      paths:
+        - 'force-app/**'
+            
+
+# Jobs to be executed
+jobs:
+    deploy-branch-to-int-and-staging-orgs:
+        runs-on: ubuntu-latest
+        if: ${{ github.actor != 'dependabot[bot]' }}
+        steps:
+            - name: Ensure node v20.9.0 or greater
+              uses: actions/setup-node@v4
+              with:
+                node-version: '>=20.9.0'
+            - name: Ensure java v11 or greater
+              uses: actions/setup-java@v4
+              with:
+                java-version: '>=11'
+                distribution: 'zulu'
+            - name: Ensure python v3.10 or greater
+              uses: actions/setup-python@v5
+              with:
+                python-version: '>=3.10'
+
+            # Install Salesforce CLI
+            - name: Install Salesforce CLI
+              run: npm install -g @salesforce/cli@latest
+
+            # install SFDX-Git-Delta plugin - https://github.com/scolladon/sfdx-git-delta
+            - name: 'Installing sfdx git delta'
+              run: | 
+                  echo y | sfdx plugins:install sfdx-git-delta
+                  sfdx plugins 
+
+            # Checkout the source code
+            - name: 'Checkout source code'
+              uses: actions/checkout@v4
+              with:
+                fetch-depth: 0
+
+            # Store secret for both otgs
+            - name: 'Populate auth file with SFDX_URL secret of the integration and staging orgs'
+              shell: bash
+              run: |
+                  echo ${{ secrets.SF_JWT_KEY}} > ./SFDX_INTEGRATION_JWT.txt
+                  echo ${{ secrets.SF_JWT_CLIENT}} > ./SFDX_INTEGRATION_JWT_CLIENT.txt
+                  echo ${{ secrets.SF_JWT_USERNAME}} > ./SFDX_INTEGRATION_JWT_USERNAME.txt
+            # Create delta packages for new, modified, or deleted metadata
+            - name: 'Create delta packages for new, modified or deleted metadata'
+              run: |
+                mkdir changed-sources
+                sf sgd source delta \
+                --to "HEAD" \
+                --from "HEAD^" \
+                --output "changed-sources/" \
+                --generate-delta \
+                --source "force-app/"
+
+            # Authenticate to Integration Org
+            - name: 'Authenticate to Integration Org'
+              run: sf org login jwt --username ./SFDX_INTEGRATION_JWT_CLIENT.txt --jwt-key-file ${{ secrets.SF_JWT_KEY}} --client-id ./SFDX_INTEGRATION_JWT_CLIENT.txt --instance-url https://test.salesforce.com --json 
+
+            # Deploy source to Integration org
+            - name: 'Deploy the entire branch to Integration org'
+              run: |
+                echo "Deploying source code to Integration org..."
+                sf project deploy start \
+                --source-dir "changed-sources/force-app" \
+                --test-level RunLocalTests \
+                --json
+
+            # Deploy destructive changes (if any) to Integration org
+            - name: 'Deploy destructive changes (if any) to Integration org'
+              if: ${{ hashFiles('changed-sources/destructiveChanges/destructiveChanges.xml') != '' }}
+              run: |
+                echo "Found destructive changes. Deploying..."
+                sf project deploy start \
+                --metadata-dir "changed-sources/destructiveChanges" \
+                --check-only \
+                --ignore-warnings
+              continue-on-error: false
+
+            # No destructive changes found
+            - name: 'Skip destructive deploy if no changes'
+              if: ${{ hashFiles('changed-sources/destructiveChanges/destructiveChanges.xml') == '' }}
+              run: echo "No destructiveChanges.xml found — skipping destructive deployment."
+
+            - name: 'Create delta packages for new, modified or deleted metadata'
+              run: | 
+                  mkdir changed-sources
+                  sf sgd source delta --to "HEAD" --from "HEAD^" --output "changed-sources/" --generate-delta --source "force-app/"
