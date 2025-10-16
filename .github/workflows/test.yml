@@ -48,10 +48,15 @@ jobs:
             # Store secret for both otgs
             - name: 'Populate auth file with SFDX_URL secret of the integration and staging orgs'
               shell: bash
+              env:
+                   SF_AUTH_KEY: ${{ secrets.SF_JWT_KEY }}
+                   SF_AUTH_CLIENT: ${{ secrets.SF_JWT_CLIENT }}
+                   SF_AUTH_USERNAME: ${{ secrets.SF_JWT_USERNAME }}
+
               run: |
-                  echo ${{ secrets.SF_JWT_KEY}} > ./SFDX_INTEGRATION_JWT.txt
-                  echo ${{ secrets.SF_JWT_CLIENT}} > ./SFDX_INTEGRATION_JWT_CLIENT.txt
-                  echo ${{ secrets.SF_JWT_USERNAME}} > ./SFDX_INTEGRATION_JWT_USERNAME.txt
+                  printf "%s" "$SF_AUTH_KEY" > ./SFDX_INTEGRATION_JWT.txt
+                  printf "%s" "$SF_AUTH_CLIENT" }} > ./SFDX_INTEGRATION_JWT_CLIENT.txt
+                  printf "%s" "$SF_AUTH_USERNAME"}} > ./SFDX_INTEGRATION_JWT_USERNAME.txt
             # Create delta packages for new, modified, or deleted metadata
             - name: 'Create delta packages for new, modified or deleted metadata'
               run: |
