@@ -1,0 +1,47 @@
+# This file is used for Git repositories to specify intentionally untracked files that Git should ignore. 
+# If you are not using git, you can delete this file. For more information see: https://git-scm.com/docs/gitignore
+# For useful gitignore templates see: https://github.com/github/gitignore
+
+# Salesforce cache
+.sfdx/
+.sf
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Dependency directories
+node_modules/
+
+# Eslint cache
+.eslintcache
+
+# MacOS system files
+.DS_Store
+
+# Windows system files
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+#Custom stuff
+.vscode
+assets/server.key
+/deployment/
+.eslintrc.*
+/force-app/main/default/classes/LogEntryEventBuilder.cls
+/force-app/main/default/classes/LogEntryEventBuilder.cls-meta.xml
+/force-app/main/default/classes/Logger.cls
+/force-app/main/default/classes/Logger.cls-meta.xml
+
+package.json
+node_modules
+package-lock.json
+
+
+force-app/main/default/lwc/jsconfig.json
+.sf/config.json
