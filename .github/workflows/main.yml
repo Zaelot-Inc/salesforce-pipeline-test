@@ -107,4 +107,5 @@ jobs:
              Sev2Violations="${{ steps.run-analyzer.outputs.num-sev2-violations }}"
              Sev3Violations="${{ steps.run-analyzer.outputs.num-sev3-violations }}"
              echo "Failed exitcode: $CurrentExitCode | Violations (critical, high): $Sev1Violations $Sev2Violations $Sev3Violations"
+
              exit -1
