@@ -2,11 +2,13 @@
 name: Deploy integration branch to integration and staging/uat orgs
 
 on:
-  push:
-    branches: [ staging ]
-    paths:
-      - 'force-app/**'
+    push:
+      branches: [ staging ]
+      paths:
+        - 'force-app/**'
+            
 
+# Jobs to be executed
 jobs:
   deploy-branch-to-int-and-staging-orgs:
     runs-on: ubuntu-latest
