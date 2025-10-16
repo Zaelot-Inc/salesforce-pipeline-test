@@ -2,6 +2,8 @@ name: Salesforce Code Analyzer Workflow
 on:
   pull_request:
     branches: [ staging, main]
+    paths:
+        - 'force-app/**'
 
 jobs: 
   salesforce-code-analyzer-workflow:
