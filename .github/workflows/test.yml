@@ -54,7 +54,7 @@ jobs:
                    SF_AUTH_USERNAME: ${{ secrets.SF_JWT_USERNAME }}
 
               run: |
-                  printf "%s" "$SF_AUTH_KEY" > ./SFDX_INTEGRATION_JWT.txt
+                  printf "%s" "$SF_AUTH_KEY" > ./SFDX_INTEGRATION_JWT.key
                   printf "%s" "$SF_AUTH_CLIENT"  > ./SFDX_INTEGRATION_JWT_CLIENT.txt
                   printf "%s" "$SF_AUTH_USERNAME" > ./SFDX_INTEGRATION_JWT_USERNAME.txt
             # Create delta packages for new, modified, or deleted metadata
@@ -70,7 +70,7 @@ jobs:
 
             # Authenticate to Staging Org
             - name: 'Authenticate to Staging Org'
-              run: sf org login jwt --username ./SFDX_INTEGRATION_JWT_CLIENT.txt --jwt-key-file ./SFDX_INTEGRATION_JWT.txt --client-id ./SFDX_INTEGRATION_JWT_CLIENT.txt --instance-url https://test.salesforce.com --json 
+              run: sf org login jwt --username ./SFDX_INTEGRATION_JWT_CLIENT.txt --jwt-key-file ./SFDX_INTEGRATION_JWT.key --client-id ./SFDX_INTEGRATION_JWT_CLIENT.txt --instance-url https://test.salesforce.com --json --set-default
 
             # Deploy source to Staging org
             - name: 'Deploy the entire branch to Staging org'

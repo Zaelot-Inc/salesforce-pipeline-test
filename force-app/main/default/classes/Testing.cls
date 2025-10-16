@@ -1,4 +1,4 @@
-public with sharing class Testing {
+public without sharing class Testing {
     public Testing() {
 
     }
