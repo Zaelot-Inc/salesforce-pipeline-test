@@ -1,0 +1,354 @@
+name: Build release branch + validate Prod (on PR merged to staging)
+
+# Run when a PR is closed — we'll verify it's merged and target branch is staging
+on:
+  pull_request:
+    types: [closed]
+    branches: [staging]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  promote-feature-branch:
+    name: Promote feature branch -> release branch & validate to Prod
+    runs-on: ubuntu-latest
+    if: ${{ github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'staging' }}
+    env:
+      # default Prod login if not provided
+      SF_LOGIN_URL_PROD: "https://test.salesforce.com"
+    steps:
+
+      - name: Checkout full repo
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set PR context variables
+        id: prinfo
+        run: |
+          echo "PR_NUMBER=${{ github.event.pull_request.number }}" >> $GITHUB_ENV
+          echo "PR_TITLE<<EOF" >> $GITHUB_ENV
+          echo "${{ github.event.pull_request.title }}" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          echo "PR_HEAD_REF=${{ github.event.pull_request.head.ref }}" >> $GITHUB_ENV
+          echo "PR_HEAD_REPO_FULL=${{ github.event.pull_request.head.repo.full_name }}" >> $GITHUB_ENV
+          echo "PR_HEAD_OWNER=${{ github.event.pull_request.head.repo.owner.login }}" >> $GITHUB_ENV
+          echo "PR_HEAD_REPO=${{ github.event.pull_request.head.repo.name }}" >> $GITHUB_ENV
+          echo "PR_HEAD_SHA=${{ github.event.pull_request.head.sha }}" >> $GITHUB_ENV
+          echo "PR_CREATED_AT=${{ github.event.pull_request.created_at }}" >> $GITHUB_ENV
+          echo "MERGED_AT=${{ github.event.pull_request.merged_at }}" >> $GITHUB_ENV
+
+      - name: Install requirements (sf CLI, sfdx-git-delta, jq, gh)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq git curl ca-certificates
+          # Node + sf CLI
+          npm i -g @salesforce/cli@latest
+          # install sfdx-git-delta (sf plugin)
+          echo y | sf plugins install sfdx-git-delta || true
+          # GitHub CLI (optional; used for comments if available)
+          if ! command -v gh >/dev/null 2>&1; then
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+              | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+              && sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+              && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+              | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+              && sudo apt update && sudo apt install -y gh
+          fi
+
+      - name: Fetch origin/main and prepare refs
+        run: |
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          # show some info
+          echo "PR #${PR_NUMBER}: head=${PR_HEAD_REF} repo=${PR_HEAD_REPO_FULL} sha=${PR_HEAD_SHA}"
+          git rev-parse --verify origin/main
+
+      - name: Fetch feature branch (supports forks)
+        id: fetch_feature
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          OWNER="${PR_HEAD_OWNER}"
+          REPONAME="${PR_HEAD_REPO}"
+          BRANCH="${PR_HEAD_REF}"
+          PR_NUM="${PR_NUMBER}"
+          echo "Attempting to fetch feature branch '${BRANCH}' from ${OWNER}/${REPONAME} ..."
+          # if same repo just fetch origin
+          if [ "${OWNER}/${REPONAME}" = "${{ github.repository }}" ]; then
+            git fetch origin "refs/heads/${BRANCH}:refs/remotes/pr/${BRANCH}" || {
+              echo "direct fetch from origin failed; trying PR ref fallback..."
+              git fetch origin "refs/pull/${PR_NUM}/head:refs/remotes/pr/${BRANCH}"
+            }
+          else
+            # fetch from fork by using authenticated URL
+            git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${REPONAME}.git" || true
+            git fetch --no-tags fork "refs/heads/${BRANCH}:refs/remotes/pr/${BRANCH}" || {
+              echo "Fetch from fork failed; trying PR ref fallback..."
+              git fetch origin "refs/pull/${PR_NUM}/head:refs/remotes/pr/${BRANCH}" || true
+            }
+          fi
+
+          # If fetch succeeded, set FETCH_REF to refs/remotes/pr/BRANCH; else fallback to PR head sha
+          if git show-ref --verify --quiet "refs/remotes/pr/${BRANCH}"; then
+            echo "Fetched branch into refs/remotes/pr/${BRANCH}"
+            echo "FETCH_REF=refs/remotes/pr/${BRANCH}" >> $GITHUB_OUTPUT
+            echo "FETCH_REF=refs/remotes/pr/${BRANCH}" >> $GITHUB_ENV
+          else
+            echo "Could not fetch branch by name; falling back to PR head SHA ${PR_HEAD_SHA}"
+            echo "FETCH_REF=${PR_HEAD_SHA}" >> $GITHUB_OUTPUT
+            echo "FETCH_REF=${PR_HEAD_SHA}" >> $GITHUB_ENV
+          fi
+
+      - name: Generate metadata delta (origin/main -> feature branch)
+        id: gen_delta
+        run: |
+          set -euo pipefail
+          TO_REF="${FETCH_REF}"
+          echo "Generating delta: origin/main -> ${TO_REF}"
+          mkdir -p changed-sources
+          sf sgd source delta \
+            --from "origin/main" \
+            --to "${TO_REF}" \
+            --output "changed-sources" \
+            --generate-delta \
+            --source "force-app/" || true
+          # if nothing under changed-sources/force-app, mark as empty
+          if [ ! -d changed-sources/force-app ] || [ -z "$(ls -A changed-sources/force-app || true)" ]; then
+            echo "no_changes=true" >> $GITHUB_OUTPUT
+            echo "No changed metadata detected between origin/main and ${TO_REF}"
+          else
+            echo "no_changes=false" >> $GITHUB_OUTPUT
+            echo "Delta generated under changed-sources/force-app"
+            # List files (relative repo paths)
+            find changed-sources/force-app -type f | sed 's#changed-sources/##' > changed-files.txt
+            echo "changed_files_list=changed-files.txt" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Abort if no metadata changes
+        if: steps.gen_delta.outputs.no_changes == 'true'
+        run: |
+          BODY="No deployable metadata detected between \`main\` and feature branch \`${PR_HEAD_REF}\` (PR #${PR_NUMBER}). Nothing to promote."
+          echo "$BODY"
+          # Comment on the original PR (best-effort; GH CLI may be present)
+          if command -v gh >/dev/null 2>&1; then
+            gh pr comment "${PR_NUMBER}" --body "$BODY" || true
+          else
+            echo "gh cli not available — skipping PR comment"
+          fi
+          exit 0
+
+      - name: Fail fast if files changed in main AFTER PR was opened (conflict detection)
+        id: conflict_check
+        run: |
+          set -euo pipefail
+          PR_CREATED="${PR_CREATED_AT}"
+          PR_CRE_TS=$(date -d "$PR_CREATED" +%s)
+          echo "PR created at $PR_CREATED -> epoch $PR_CRE_TS"
+          conflicts_found=false
+          while IFS= read -r repo_file; do
+            # repo_file is like force-app/... ; check last commit on origin/main touching that file
+            if git ls-tree -r --name-only origin/main | grep -xF -- "$repo_file" >/dev/null 2>&1; then
+              last_ts=$(git log -1 --format=%ct origin/main -- "$repo_file" || echo 0)
+            else
+              last_ts=0
+            fi
+            # if last_ts > PR_CRE_TS then main changed that file after PR opened -> potential conflict
+            if [ -n "$last_ts" ] && [ "$last_ts" -gt "$PR_CRE_TS" ]; then
+              echo "Conflict candidate: $repo_file changed on main at $(date -d @$last_ts) which is after PR creation $(date -d @$PR_CRE_TS)"
+              conflicts_found=true
+            fi
+          done < changed-files.txt
+
+          if [ "$conflicts_found" = "true" ]; then
+            BODY="⛔ *Promotion blocked*: Some files changed on \`main\` after PR #${PR_NUMBER} was opened. This likely creates a conflict if we try to promote only this feature. Please rebase/merge main into the feature branch or resolve conflicts manually.\n\nFiles changed on main after PR creation:\n"
+            # append a short list for the body
+            while IFS= read -r repo_file; do
+              if git ls-tree -r --name-only origin/main | grep -xF -- "$repo_file" >/dev/null 2>&1; then
+                last_ts=$(git log -1 --format=%ct origin/main -- "$repo_file" || echo 0)
+              else
+                last_ts=0
+              fi
+              if [ -n "$last_ts" ] && [ "$last_ts" -gt "$PR_CRE_TS" ]; then
+                BODY="${BODY}- \`${repo_file}\` (main updated: $(date -d @$last_ts))\n"
+              fi
+            done < changed-files.txt
+
+            echo "$BODY"
+            # Post comment to PR (best-effort)
+            if command -v gh >/dev/null 2>&1; then
+              gh pr comment "${PR_NUMBER}" --body "$BODY" || true
+            fi
+            echo "conflict=true" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "No conflicting changes on main detected."
+            echo "conflict=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create release branch from origin/main
+        id: create_branch
+        run: |
+          set -euo pipefail
+          SHORTSHA=$(echo "${PR_HEAD_SHA}" | cut -c1-7)
+          RELEASE_BRANCH="release/pr-${PR_NUMBER}-${SHORTSHA}"
+          echo "Creating release branch ${RELEASE_BRANCH} from origin/main"
+          git checkout -b "${RELEASE_BRANCH}" origin/main
+          echo "RELEASE_BRANCH=${RELEASE_BRANCH}" >> $GITHUB_ENV
+          echo "release_branch=${RELEASE_BRANCH}" >> $GITHUB_OUTPUT
+
+      - name: Copy delta into release branch and commit
+        run: |
+          set -euo pipefail
+          # Copy changed metadata from changed-sources/force-app into the repo's force-app
+          rsync -av --delete changed-sources/force-app/ force-app/
+          git add -A force-app/
+          if git diff --cached --quiet; then
+            echo "No differences to commit after copying delta. Nothing to push."
+            gh pr comment "${PR_NUMBER}" --body "Release creation aborted: no changes to commit on release branch for PR #${PR_NUMBER}." || true
+            exit 0
+          fi
+          git commit -m "release: promote PR #${PR_NUMBER} (${PR_HEAD_REF} -> main) [automated]" || true
+          git push origin "HEAD:${RELEASE_BRANCH}"
+
+      - name: Open PR from release branch into main
+        id: open_pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const head = process.env.RELEASE_BRANCH;
+            const base = "main";
+            const title = `[release] Promote PR #${process.env.PR_NUMBER} -> main: ${process.env.PR_TITLE}`;
+            const body = `Automated release PR to promote feature from staging PR #${process.env.PR_NUMBER}.\n\nFeature branch: \`${process.env.PR_HEAD_REF}\`\nFeature head SHA: \`${process.env.PR_HEAD_SHA}\`\n\nThis PR contains only the metadata delta between \`origin/main\` and the feature branch.`;
+            const pr = await github.rest.pulls.create({
+              owner, repo, title, head, base, body, maintainer_can_modify: true
+            });
+            core.info(`Created release PR #${pr.data.number}`);
+            core.setOutput('release_pr_number', pr.data.number.toString());
+            core.setOutput('release_pr_url', pr.data.html_url);
+
+      - name: Comment original staging PR about release PR
+        if: always()
+        run: |
+          RELEASE_PR_NUMBER=${{ steps.open_pr.outputs.release_pr_number }}
+          RELEASE_PR_URL=${{ steps.open_pr.outputs.release_pr_url }}
+          BODY="✅ Automated release PR created: #${RELEASE_PR_NUMBER} (${RELEASE_PR_URL}). This PR contains only the metadata changes from the feature branch and will be validated against Production (check-only)."
+          echo "$BODY"
+          if command -v gh >/dev/null 2>&1; then
+            gh pr comment "${PR_NUMBER}" --body "$BODY" || true
+          fi
+
+      - name: Authenticate to Production (JWT) — write key file
+        if: always()
+        env:
+          SF_JWT_KEY_PROD: ${{ secrets.SF_JWT_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SF_JWT_KEY_PROD:-}" ]; then
+            echo "SF_JWT_KEY_PROD not set; skipping prod validation"
+            exit 78
+          fi
+          umask 177
+          printf "%s" "$SF_JWT_KEY_PROD" > jwt_prod.key
+          echo "Wrote jwt_prod.key (umask 177)."
+
+      - name: Login to Production (JWT)
+        if: always()
+        env:
+          SF_JWT_CLIENT_PROD: ${{ secrets.SF_JWT_CLIENT }}
+          SF_JWT_USERNAME_PROD: ${{ secrets.SF_JWT_USERNAME }}
+          SF_LOGIN_URL_PROD: ${{ env.SF_LOGIN_URL_PROD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SF_JWT_CLIENT_PROD:-}" ] || [ -z "${SF_JWT_USERNAME_PROD:-}" ]; then
+            echo "SF_JWT_CLIENT_PROD or SF_JWT_USERNAME_PROD not set; skipping prod validation"
+            exit 78
+          fi
+          sf org login jwt \
+            --username "$SF_JWT_USERNAME_PROD" \
+            --client-id "$SF_JWT_CLIENT_PROD" \
+            --jwt-key-file jwt_prod.key \
+            --instance-url "${SF_LOGIN_URL_PROD}" \
+            --alias ProdForValidation --set-default --json
+
+      - name: Validate-only deploy to Production (check-only) and persist JSON
+        if: always()
+        run: |
+          set -euo pipefail
+          # use the changed-sources Dir as the set to validate; you could also create a manifest
+          if [ ! -d changed-sources/force-app ]; then
+            echo "No changed-sources present to validate; skipping prod validation."
+            exit 78
+          fi
+          # Deploy check-only (dry-run) against Prod
+          sf project deploy start \
+            --source-dir "changed-sources/force-app" \
+            --target-org ProdForValidation \
+            --dry-run \
+            --test-level RunLocalTests \
+            --wait 120 \
+            --json > prod-validate.json || true
+          echo "Wrote prod-validate.json (may contain failure details)."
+
+      - name: Upload prod validation JSON artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-validate-json-pr-${{ env.PR_NUMBER }}
+          path: prod-validate.json
+
+      - name: Summarize validation and post to release PR (best-effort)
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const owner = context.repo.owner, repo = context.repo.repo;
+            const prNum = parseInt(process.env.PR_NUMBER,10);
+            const releasePrNum = parseInt(core.getInput('release_pr_number') || process.env.RELEASE_PR_NUMBER || process.env.RELEASE_PR || 0, 10) || parseInt(process.env.RELEASE_PR_NUMBER || 0, 10) || parseInt(process.env.RELEASE_PR || 0, 10);
+            // Read prod-validate.json if exists
+            let body = `### Production validation result for release PR #${releasePrNum || 'TBD'} (origin: PR #${prNum})\n\n`;
+            const file = 'prod-validate.json';
+            if (fs.existsSync(file)) {
+              try {
+                const data = JSON.parse(fs.readFileSync(file,'utf8'));
+                const failures = (((data || {}).result || {}).details || {}).runTestResult?.failures || [];
+                const deployStatus = data?.status || (data?.result?.status) || 'unknown';
+                body += `Validation status: **${deployStatus}**\n\na`;
+                if (failures && failures.length) {
+                  body += `Found **${failures.length}** failing Apex test(s):\n\n| Class | Method | Message |\n|---|---|---|\n`;
+                  for (const f of failures.slice(0,30)) {
+                    const msg = String(f.message || '').replace(/\n/g, ' ').slice(0,500);
+                    body += `| ${f.name} | ${f.methodName} | ${msg} |\n`;
+                  }
+                  body += `\n(Full validation JSON uploaded as artifact)\n`;
+                } else {
+                  body += "No Apex test failures found in the check-only validation.\n";
+                }
+              } catch (e) {
+                body += `Could not parse prod-validate.json: ${e.message}\n`;
+              }
+            } else {
+              body += "No prod-validate.json produced (validation skipped or failed before runtime).\n";
+            }
+            // Post to release PR if exists, else to original PR
+            const postTo = releasePrNum || prNum;
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: postTo,
+              body
+            });
+
+            // If validation had failures, mark the workflow as failed
+            const data = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file,'utf8')) : null;
+            const failures = data ? ((((data || {}).result || {}).details || {}).runTestResult?.failures || []) : [];
+            if (failures && failures.length) {
+              core.setFailed(`Prod validation reported ${failures.length} Apex failures.`);
+            }
+        with:
+          release_pr_number: ${{ steps.open_pr.outputs.release_pr_number }}
+
