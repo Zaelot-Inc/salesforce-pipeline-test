@@ -305,13 +305,24 @@ jobs:
       - name: Summarize validation and post to release PR (best-effort)
         if: always()
         uses: actions/github-script@v7
+        env:
+          RELEASE_PR_NUMBER: ${{ steps.open_pr.outputs.release_pr_number }}
         with:
           script: |
             const fs = require('fs');
+            const core = require('@actions/core');
             const owner = context.repo.owner, repo = context.repo.repo;
             const prNum = parseInt(process.env.PR_NUMBER,10);
-            const releasePrNum = parseInt(core.getInput('release_pr_number') || process.env.RELEASE_PR_NUMBER || process.env.RELEASE_PR || 0, 10) || parseInt(process.env.RELEASE_PR_NUMBER || 0, 10) || parseInt(process.env.RELEASE_PR || 0, 10);
-            // Read prod-validate.json if exists
+            // read release PR number from env (fallbacks handled below)
+            let releasePrNum = 0;
+            if (process.env.RELEASE_PR_NUMBER) {
+              releasePrNum = parseInt(process.env.RELEASE_PR_NUMBER, 10) || 0;
+            } else if (process.env.RELEASE_PR) {
+              releasePrNum = parseInt(process.env.RELEASE_PR, 10) || 0;
+            } else if (process.env.RELEASE_PR_NUMBER) {
+              releasePrNum = parseInt(process.env.RELEASE_PR_NUMBER, 10) || 0;
+            }
+
             let body = `### Production validation result for release PR #${releasePrNum || 'TBD'} (origin: PR #${prNum})\n\n`;
             const file = 'prod-validate.json';
             if (fs.existsSync(file)) {
@@ -319,7 +330,7 @@ jobs:
                 const data = JSON.parse(fs.readFileSync(file,'utf8'));
                 const failures = (((data || {}).result || {}).details || {}).runTestResult?.failures || [];
                 const deployStatus = data?.status || (data?.result?.status) || 'unknown';
-                body += `Validation status: **${deployStatus}**\n\na`;
+                body += `Validation status: **${deployStatus}**\n\n`;
                 if (failures && failures.length) {
                   body += `Found **${failures.length}** failing Apex test(s):\n\n| Class | Method | Message |\n|---|---|---|\n`;
                   for (const f of failures.slice(0,30)) {
@@ -336,7 +347,6 @@ jobs:
             } else {
               body += "No prod-validate.json produced (validation skipped or failed before runtime).\n";
             }
-            // Post to release PR if exists, else to original PR
             const postTo = releasePrNum || prNum;
             await github.rest.issues.createComment({
               owner, repo, issue_number: postTo,
@@ -349,6 +359,3 @@ jobs:
             if (failures && failures.length) {
               core.setFailed(`Prod validation reported ${failures.length} Apex failures.`);
             }
-        with:
-          release_pr_number: ${{ steps.open_pr.outputs.release_pr_number }}
-
