@@ -70,7 +70,9 @@ jobs:
 
             # Authenticate to Staging Org
             - name: 'Authenticate to Staging Org'
-              run: sf org login jwt --username ./SFDX_INTEGRATION_JWT_CLIENT.txt --jwt-key-file ./SFDX_INTEGRATION_JWT.key --client-id ./SFDX_INTEGRATION_JWT_CLIENT.txt --instance-url https://test.salesforce.com --json --set-default
+              run: |
+                    printf "$SF_AUTH_CLIENT"
+                    sf org login jwt --username ./SFDX_INTEGRATION_JWT_USERNAME.txt --jwt-key-file ./SFDX_INTEGRATION_JWT.key --client-id ./SFDX_INTEGRATION_JWT_CLIENT.txt --instance-url https://test.salesforce.com --json --set-default
 
             # Deploy source to Staging org
             - name: 'Deploy the entire branch to Staging org'
