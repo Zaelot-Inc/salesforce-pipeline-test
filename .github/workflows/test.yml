@@ -1,106 +1,207 @@
 # Unique name for this workflow
 name: Deploy integration branch to integration and staging/uat orgs
 
-# Definition when the workflow should run
 on:
-    push:
-      branches: [ staging ]
-      paths:
-        - 'force-app/**'
-            
+  push:
+    branches: [ staging ]
+    paths:
+      - 'force-app/**'
 
-# Jobs to be executed
 jobs:
-    deploy-branch-to-int-and-staging-orgs:
-        runs-on: ubuntu-latest
-        if: ${{ github.actor != 'dependabot[bot]' }}
-        steps:
-            - name: Ensure node v20.9.0 or greater
-              uses: actions/setup-node@v4
-              with:
-                node-version: '>=20.9.0'
-            - name: Ensure java v11 or greater
-              uses: actions/setup-java@v4
-              with:
-                java-version: '>=11'
-                distribution: 'zulu'
-            - name: Ensure python v3.10 or greater
-              uses: actions/setup-python@v5
-              with:
-                python-version: '>=3.10'
+  deploy-branch-to-int-and-staging-orgs:
+    runs-on: ubuntu-latest
+    if: ${{ github.actor != 'dependabot[bot]' }}
+    steps:
+      - name: Ensure node v20.9.0 or greater
+        uses: actions/setup-node@v4
+        with:
+          node-version: '>=20.9.0'
 
-            # Install Salesforce CLI
-            - name: Install Salesforce CLI
-              run: npm install -g @salesforce/cli@latest
+      - name: Ensure java v11 or greater
+        uses: actions/setup-java@v4
+        with:
+          java-version: '>=11'
+          distribution: 'zulu'
 
-            # install SFDX-Git-Delta plugin - https://github.com/scolladon/sfdx-git-delta
-            - name: 'Installing sfdx git delta'
-              run: | 
-                  echo y | sf plugins install sfdx-git-delta
-                  sf plugins 
+      - name: Ensure python v3.10 or greater
+        uses: actions/setup-python@v5
+        with:
+          python-version: '>=3.10'
 
-            # Checkout the source code
-            - name: 'Checkout source code'
-              uses: actions/checkout@v5
-              with:
-                fetch-depth: 0
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
 
-            # Store secret for both otgs
-            - name: 'Populate auth file with SF_JWT secret of the staging orgs'
-              shell: bash
-              env:
-                   SF_AUTH_KEY: ${{ secrets.SF_JWT_KEY }}
-              run: |
-                  printf "%s" "$SF_AUTH_KEY" > ./SFDX_INTEGRATION_JWT.key
-            # Create delta packages for new, modified, or deleted metadata
-            - name: 'Create delta packages for new, modified or deleted metadata'
-              run: |
-                mkdir changed-sources
-                sf sgd source delta \
-                --to "HEAD" \
-                --from "HEAD^" \
-                --output "changed-sources/" \
-                --generate-delta \
-                --source "force-app/"
+      # Install Salesforce CLI
+      - name: Install Salesforce CLI
+        run: npm install -g @salesforce/cli@latest
 
-            # Authenticate to Staging Org
-            - name: 'Authenticate to Staging Org'
-              env:  
-                  SF_AUTH_CLIENT: ${{ secrets.SF_JWT_CLIENT }}
-                  SF_AUTH_USERNAME: ${{ secrets.SF_JWT_USERNAME }}
-              run: |
-                    printf "$SF_AUTH_CLIENT"
-                    sf org login jwt --username "$SF_AUTH_USERNAME" --jwt-key-file ./SFDX_INTEGRATION_JWT.key --client-id "$SF_AUTH_CLIENT" --instance-url https://test.salesforce.com --json --set-default
+      # install sfdx-git-delta plugin - https://github.com/scolladon/sfdx-git-delta
+      - name: Installing sfdx git delta
+        run: |
+          echo y | sf plugins install sfdx-git-delta
+          sf plugins
 
-            # Deploy source to Staging org
-            - name: 'Deploy the entire branch to Staging org'
-              run: |
-                echo "Deploying source code to Staging org..."
-                sf project deploy start \
-                --source-dir "changed-sources/force-app" \
-                --test-level RunLocalTests \
-                --json
+      # Checkout the source code
+      - name: Checkout source code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
-            # Deploy destructive changes (if any) to Staging org
-            - name: 'Deploy destructive changes (if any) to Staging org'
-              if: ${{ hashFiles('changed-sources/destructiveChanges/destructiveChanges.xml') != '' }}
-              run: |
-                echo "Found destructive changes. Deploying..."
-                sf project deploy start \
-                --metadata-dir "changed-sources/destructiveChanges" \
-                --check-only \
-                --ignore-warnings
-                --json > prod-validate.json
+      # Write JWT private key to file (safe)
+      - name: Populate auth file with SF_JWT secret of the staging org
+        shell: bash
+        env:
+          SF_AUTH_KEY: ${{ secrets.SF_JWT_KEY }}
+        run: |
+          umask 177
+          printf "%s" "$SF_AUTH_KEY" > ./SFDX_INTEGRATION_JWT.key
 
-                  # Try common keys in case of CLI version differences
-                DEPLOY_ID=$(jq -r '.result.id // .result.deploymentId // .id // empty' prod-validate.json)
-                if [ -z "$DEPLOY_ID" ]; then
-                  echo "Could not find deploy id in JSON:"; cat prod-validate.json; exit 1
-                fi
-                echo "deploy_id=$DEPLOY_ID"
-              continue-on-error: false
-          
-            # No destructive changes found
-            - name: 'Skip destructive deploy if no changes'
-              if: ${{ hashFiles('changed-sources/destructiveChanges/destructiveChanges.xml') == '' }}
-              run: echo "No destructiveChanges.xml found — skipping destructive deployment."
+      # Create delta packages for new, modified, or deleted metadata
+      - name: Create delta packages for new, modified or deleted metadata
+        run: |
+          mkdir -p changed-sources
+          sf sgd source delta \
+            --to "HEAD" \
+            --from "HEAD^" \
+            --output "changed-sources/" \
+            --generate-delta \
+            --source "force-app/"
+
+      # Authenticate to Staging Org (JWT)
+      - name: Authenticate to Staging Org
+        env:
+          SF_AUTH_CLIENT:   ${{ secrets.SF_JWT_CLIENT }}     # Connected App Consumer Key
+          SF_AUTH_USERNAME: ${{ secrets.SF_JWT_USERNAME }}   # Username in target sandbox
+        run: |
+          sf org login jwt \
+            --username "$SF_AUTH_USERNAME" \
+            --jwt-key-file ./SFDX_INTEGRATION_JWT.key \
+            --client-id "$SF_AUTH_CLIENT" \
+            --instance-url https://test.salesforce.com \
+            --json --set-default
+
+      # Deploy source to Staging org (SAVE JSON)
+      - name: Deploy the delta to Staging org
+        run: |
+          echo "Deploying source code to Staging org..."
+          sf project deploy start \
+            --source-dir "changed-sources/force-app" \
+            --test-level RunLocalTests \
+            --wait 120 \
+            --json > staging-deploy.json
+          echo "Wrote staging-deploy.json"
+
+      # Summarize Apex failures -> GitHub Annotations (and fail job)
+      - name: Summarize Apex test failures (annotations)
+        if: always()
+        shell: bash
+        run: |
+          file="staging-deploy.json"
+          if [ ! -s "$file" ]; then
+            echo "::warning title=No JSON::staging-deploy.json not found or empty"
+            exit 0
+          fi
+          fails_json=$(jq '.result.details.runTestResult.failures // []' "$file")
+          count=$(echo "$fails_json" | jq 'length')
+          echo "fail_count=$count" >> $GITHUB_ENV
+          if [[ "$count" -gt 0 ]]; then
+            echo "Found $count failing tests"
+            echo "$fails_json" | jq -r '.[] | "\(.name).\(.methodName)|\(.message)|\(.stackTrace // "")"' | \
+            while IFS='|' read -r id msg stack; do
+              echo "::error title=Apex test failed: $id::$(printf "%s\n%s" "$msg" "$stack")"
+            done
+          else
+            echo "No Apex test failures 🎉"
+          fi
+
+      # Deploy destructive changes (if any) to Staging org (SAVE JSON)
+      - name: Deploy destructive changes (if any) to Staging org
+        if: ${{ hashFiles('changed-sources/destructiveChanges/destructiveChanges.xml') != '' }}
+        shell: bash
+        run: |
+          echo "Found destructive changes. Deploying..."
+          sf project deploy start \
+            --metadata-dir "changed-sources/destructiveChanges" \
+            --check-only \
+            --ignore-warnings \
+            --wait 120 \
+            --json > staging-destructive.json
+
+          DEPLOY_ID=$(jq -r '.result.id // .result.deploymentId // .id // empty' staging-destructive.json)
+          if [ -z "$DEPLOY_ID" ]; then
+            echo "Could not find deploy id in JSON:"; cat staging-destructive.json; exit 1
+          fi
+          echo "destructive_deploy_id=$DEPLOY_ID" >> $GITHUB_ENV
+
+      - name: Skip destructive deploy if no changes
+        if: ${{ hashFiles('changed-sources/destructiveChanges/destructiveChanges.xml') == '' }}
+        run: echo "No destructiveChanges.xml found — skipping destructive deployment."
+
+      # Upload JSON artifacts (optional, helps debugging)
+      - name: Upload JSON results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-deploy-json
+          path: |
+            staging-deploy.json
+            staging-destructive.json
+
+      # 💬 Post a PR comment with failures table (find PR by commit on staging)
+      - name: Comment PR with test failures
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const core = require('@actions/core');
+
+            // Load JSON if present
+            const path = 'staging-deploy.json';
+            let fails = [];
+            if (fs.existsSync(path)) {
+              try {
+                const data = JSON.parse(fs.readFileSync(path, 'utf8'));
+                fails = (((data || {}).result || {}).details || {}).runTestResult?.failures || [];
+              } catch (e) {
+                core.warning('Could not parse staging-deploy.json: ' + e.message);
+              }
+            }
+
+            // Find the PR(s) associated with this commit (the merge to staging)
+            const {owner, repo} = context.repo;
+            const sha = context.sha;
+            const resp = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
+            const prs = (resp.data || []).filter(pr => pr.base?.ref === 'staging');
+
+            if (!prs.length) {
+              core.info('No associated PR to staging found for this commit; skipping PR comment.');
+              return;
+            }
+
+            // Pick the most recent PR
+            const pr = prs.sort((a,b)=> new Date(b.updated_at) - new Date(a.updated_at))[0];
+
+            // Build body
+            if (!fails.length) {
+              const okBody = `✅ **Staging deploy validation**\nNo Apex test failures detected for commit \`${sha.slice(0,7)}\`.`;
+              await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body: okBody });
+              return;
+            }
+
+            let body = `### ❌ Apex test failures (${fails.length}) for staging deploy\n` +
+                       `Commit: \`${sha}\`\n\n` +
+                       `| Class | Method | Message |\n|---|---|---|\n`;
+            for (const f of fails) {
+              const msg = String(f.message || '').replace(/\n/g, ' ').slice(0, 500);
+              body += `| ${f.name} | ${f.methodName} | ${msg} |\n`;
+            }
+
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: pr.number, body
+            });
+
+            // Optionally fail the job if there were failures
+            if (fails.length > 0) {
+              core.setFailed(`Apex tests failed: ${fails.length}`);
+            }
