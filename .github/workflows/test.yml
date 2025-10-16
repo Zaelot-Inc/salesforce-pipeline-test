@@ -46,13 +46,10 @@ jobs:
                 fetch-depth: 0
 
             # Store secret for both otgs
-            - name: 'Populate auth file with SFDX_URL secret of the integration and staging orgs'
+            - name: 'Populate auth file with SF_JWT secret of the staging orgs'
               shell: bash
               env:
                    SF_AUTH_KEY: ${{ secrets.SF_JWT_KEY }}
-                   SF_AUTH_CLIENT: ${{ secrets.SF_JWT_CLIENT }}
-                   SF_AUTH_USERNAME: ${{ secrets.SF_JWT_USERNAME }}
-
               run: |
                   printf "%s" "$SF_AUTH_KEY" > ./SFDX_INTEGRATION_JWT.key
             # Create delta packages for new, modified, or deleted metadata
@@ -68,6 +65,9 @@ jobs:
 
             # Authenticate to Staging Org
             - name: 'Authenticate to Staging Org'
+              env:  
+                  SF_AUTH_CLIENT: ${{ secrets.SF_JWT_CLIENT }}
+                  SF_AUTH_USERNAME: ${{ secrets.SF_JWT_USERNAME }}
               run: |
                     printf "$SF_AUTH_CLIENT"
                     sf org login jwt --username "$SF_AUTH_USERNAME" --jwt-key-file ./SFDX_INTEGRATION_JWT.key --client-id "$SF_AUTH_CLIENT" --instance-url https://test.salesforce.com --json --set-default
