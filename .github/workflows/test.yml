@@ -4,7 +4,7 @@ name: Deploy integration branch to integration and staging/uat orgs
 # Definition when the workflow should run
 on:
     push:
-      branches: [ integration ]
+      branches: [ staging ]
       paths:
         - 'force-app/**'
             
@@ -36,12 +36,12 @@ jobs:
             # install SFDX-Git-Delta plugin - https://github.com/scolladon/sfdx-git-delta
             - name: 'Installing sfdx git delta'
               run: | 
-                  echo y | sfdx plugins:install sfdx-git-delta
-                  sfdx plugins 
+                  echo y | sf plugins install sfdx-git-delta
+                  sf plugins 
 
             # Checkout the source code
             - name: 'Checkout source code'
-              uses: actions/checkout@v4
+              uses: actions/checkout@v5
               with:
                 fetch-depth: 0
 
@@ -63,21 +63,21 @@ jobs:
                 --generate-delta \
                 --source "force-app/"
 
-            # Authenticate to Integration Org
-            - name: 'Authenticate to Integration Org'
+            # Authenticate to Staging Org
+            - name: 'Authenticate to Staging Org'
               run: sf org login jwt --username ./SFDX_INTEGRATION_JWT_CLIENT.txt --jwt-key-file ${{ secrets.SF_JWT_KEY}} --client-id ./SFDX_INTEGRATION_JWT_CLIENT.txt --instance-url https://test.salesforce.com --json 
 
-            # Deploy source to Integration org
-            - name: 'Deploy the entire branch to Integration org'
+            # Deploy source to Staging org
+            - name: 'Deploy the entire branch to Staging org'
               run: |
-                echo "Deploying source code to Integration org..."
+                echo "Deploying source code to Staging org..."
                 sf project deploy start \
                 --source-dir "changed-sources/force-app" \
                 --test-level RunLocalTests \
                 --json
 
-            # Deploy destructive changes (if any) to Integration org
-            - name: 'Deploy destructive changes (if any) to Integration org'
+            # Deploy destructive changes (if any) to Staging org
+            - name: 'Deploy destructive changes (if any) to Staging org'
               if: ${{ hashFiles('changed-sources/destructiveChanges/destructiveChanges.xml') != '' }}
               run: |
                 echo "Found destructive changes. Deploying..."
@@ -85,14 +85,17 @@ jobs:
                 --metadata-dir "changed-sources/destructiveChanges" \
                 --check-only \
                 --ignore-warnings
-              continue-on-error: false
+                --json > prod-validate.json
 
+                  # Try common keys in case of CLI version differences
+                DEPLOY_ID=$(jq -r '.result.id // .result.deploymentId // .id // empty' prod-validate.json)
+                if [ -z "$DEPLOY_ID" ]; then
+                  echo "Could not find deploy id in JSON:"; cat prod-validate.json; exit 1
+                fi
+                echo "deploy_id=$DEPLOY_ID"
+              continue-on-error: false
+          
             # No destructive changes found
             - name: 'Skip destructive deploy if no changes'
               if: ${{ hashFiles('changed-sources/destructiveChanges/destructiveChanges.xml') == '' }}
               run: echo "No destructiveChanges.xml found — skipping destructive deployment."
-
-            - name: 'Create delta packages for new, modified or deleted metadata'
-              run: | 
-                  mkdir changed-sources
-                  sf sgd source delta --to "HEAD" --from "HEAD^" --output "changed-sources/" --generate-delta --source "force-app/"
