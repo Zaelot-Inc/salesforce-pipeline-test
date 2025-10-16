@@ -1,98 +1,108 @@
-# Unique name for this workflow
-name: Deploy integration branch to integration and staging/uat orgs
-
-# Definition when the workflow should run
+name: Salesforce Code Analyzer Workflow
 on:
-    push:
-      branches: [ integration ]
-      paths:
-        - 'force-app/**'
-            
+  pull_request:
+    branches: [ staging, main]
 
-# Jobs to be executed
-jobs:
-    deploy-branch-to-int-and-staging-orgs:
-        runs-on: ubuntu-latest
-        if: ${{ github.actor != 'dependabot[bot]' }}
-        steps:
-            - name: Ensure node v20.9.0 or greater
-              uses: actions/setup-node@v4
-              with:
-                node-version: '>=20.9.0'
-            - name: Ensure java v11 or greater
-              uses: actions/setup-java@v4
-              with:
-                java-version: '>=11'
-                distribution: 'zulu'
-            - name: Ensure python v3.10 or greater
-              uses: actions/setup-python@v5
-              with:
-                python-version: '>=3.10'
+jobs: 
+  salesforce-code-analyzer-workflow:
+    permissions:
+      pull-requests: write # Grants permission to create a pull request review. Only necessary if running against pull requests.
+      contents: read # Grants permission to check out the repository. Only necessary for private repos.
+      actions: read # Grants permission to read the in-progress actions. Only necessary for private repos.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out files
+        uses: actions/checkout@v4
+        with:
+          # Needed so we can diff against the PR base
+          fetch-depth: 0
+      # 1) Collect changed files in the PR
+      - uses: actions/github-script@v7
+        id: changed
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) { core.setOutput('any_changed','false'); return; }
 
-            # Install Salesforce CLI
-            - name: Install Salesforce CLI
-              run: npm install -g @salesforce/cli@latest
+            const files = await github.paginate(
+              github.rest.pulls.listFiles,
+              { owner: context.repo.owner, repo: context.repo.repo, pull_number: pr.number, per_page: 100 }
+            );
 
-            # install SFDX-Git-Delta plugin - https://github.com/scolladon/sfdx-git-delta
-            - name: 'Installing sfdx git delta'
-              run: | 
-                  echo y | sfdx plugins:install sfdx-git-delta
-                  sfdx plugins 
+            const keep = files
+              .filter(f => f.status !== 'removed' && 
+                      (f.filename.endsWith('.html') ||
+                       f.filename.endsWith('.js') ||
+                       f.filename.endsWith('.css') ||
+                       f.filename.endsWith('.cls') ||
+                       f.filename.endsWith('.trigger') ||
+                       f.filename.endsWith('.xml')
+                      ))     // exclude deletions
+              .map(f => f.filename);                   // API already gives the new path on renames
+            console.log(keep);
+            core.setOutput('any_changed', String(keep.length > 0));
+            core.setOutput('files_nl', keep.join('\n'));
 
-            # Checkout the source code
-            - name: 'Checkout source code'
-              uses: actions/checkout@v4
-              with:
-                fetch-depth: 0
+      # 2) Short-circuit if nothing relevant changed
+      - name: No relevant changes
+        if: steps.changed.outputs.any_changed == 'false'
+        run: echo "No Apex/LWC/JS changes — skipping." && exit 0
 
-            # Store secret for both otgs
-            - name: 'Populate auth file with SFDX_URL secret of the integration and staging orgs'
-              shell: bash
-              run: |
-                  echo ${{ secrets.SF_JWT_KEY}} > ./SFDX_INTEGRATION_JWT.txt
-                  echo ${{ secrets.SF_JWT_CLIENT}} > ./SFDX_INTEGRATION_JWT_CLIENT.txt
-                  echo ${{ secrets.SF_JWT_USERNAME}} > ./SFDX_INTEGRATION_JWT_USERNAME.txt
-            # Create delta packages for new, modified, or deleted metadata
-            - name: 'Create delta packages for new, modified or deleted metadata'
-              run: |
-                mkdir changed-sources
-                sf sgd source delta \
-                --to "HEAD" \
-                --from "HEAD^" \
-                --output "changed-sources/" \
-                --generate-delta \
-                --source "force-app/"
+      # 3) Save and split the list (avoids overlong commands)
+      - name: Prepare file lists
+        id: targets
+        if: steps.changed.outputs.any_changed == 'true'
+        shell: bash
+        run: |
+          args=""
+          # Consume the newline-delimited list from the previous step's output
+          while IFS= read -r file; do
+            args+=" --target "$(printf %q "$file")
+          done <<< "${{ steps.changed.outputs.files_nl }}"
+          echo "args=${args}" >> "$GITHUB_OUTPUT"
+      # PREREQUISITES - Only needed if the runner doesn't already satisfy these requirements.
+      - name: Ensure node v20.9.0 or greater
+        uses: actions/setup-node@v4
+        with:
+          node-version: '>=20.9.0'
+      - name: Ensure java v11 or greater
+        uses: actions/setup-java@v4
+        with:
+          java-version: '>=11'
+          distribution: 'zulu'
+      - name: Ensure python v3.10 or greater
+        uses: actions/setup-python@v5
+        with:
+          python-version: '>=3.10'
 
-            # Authenticate to Integration Org
-            - name: 'Authenticate to Integration Org'
-              run: sf org login jwt --username ./SFDX_INTEGRATION_JWT_CLIENT.txt --jwt-key-file ${{ secrets.SF_JWT_KEY}} --client-id ./SFDX_INTEGRATION_JWT_CLIENT.txt --instance-url https://test.salesforce.com --json 
+      - name: Install Salesforce CLI
+        run: npm install -g @salesforce/cli@latest
 
-            # Deploy source to Integration org
-            - name: 'Deploy the entire branch to Integration org'
-              run: |
-                echo "Deploying source code to Integration org..."
-                sf project deploy start \
-                --source-dir "changed-sources/force-app" \
-                --test-level RunLocalTests \
-                --json
+      - name: Install Latest Salesforce Code Analyzer CLI Plugin
+        run: sf plugins install code-analyzer@latest
 
-            # Deploy destructive changes (if any) to Integration org
-            - name: 'Deploy destructive changes (if any) to Integration org'
-              if: ${{ hashFiles('changed-sources/destructiveChanges/destructiveChanges.xml') != '' }}
-              run: |
-                echo "Found destructive changes. Deploying..."
-                sf project deploy start \
-                --metadata-dir "changed-sources/destructiveChanges" \
-                --check-only \
-                --ignore-warnings
-              continue-on-error: false
+      - name: Run Salesforce Code Analyzer
+        id: run-analyzer
+        uses: forcedotcom/run-code-analyzer@v2
+        with:
+          run-arguments: >-
+            --view detail
+            --output-file sfca_results.json
+            ${{ steps.targets.outputs.args }}
+          results-artifact-name: salesforce-code-analyzer-results
+          github-token: ${{ github.token }}
 
-            # No destructive changes found
-            - name: 'Skip destructive deploy if no changes'
-              if: ${{ hashFiles('changed-sources/destructiveChanges/destructiveChanges.xml') == '' }}
-              run: echo "No destructiveChanges.xml found — skipping destructive deployment."
+      - name: Check the Outputs to Determine Whether to Fail (at least one sev1 or five sev2 violations)
+        if: |
+          steps.run-analyzer.outputs.exit-code > 0 ||
+          steps.run-analyzer.outputs.num-sev1-violations > 0 ||
+          steps.run-analyzer.outputs.num-sev2-violations > 0 ||
+          steps.run-analyzer.outputs.num-sev3-violations > 5 
 
-            - name: 'Create delta packages for new, modified or deleted metadata'
-              run: | 
-                  mkdir changed-sources
-                  sf sgd source delta --to "HEAD" --from "HEAD^" --output "changed-sources/" --generate-delta --source "force-app/"
+        run: |
+             CurrentExitCode="${{ steps.run-analyzer.outputs.exit-code }}"
+             Sev1Violations="${{ steps.run-analyzer.outputs.num-sev1-violations }}"
+             Sev2Violations="${{ steps.run-analyzer.outputs.num-sev2-violations }}"
+             Sev3Violations="${{ steps.run-analyzer.outputs.num-sev3-violations }}"
+             echo "Failed exitcode: $CurrentExitCode | Violations (critical, high): $Sev1Violations $Sev2Violations $Sev3Violations"
+             exit -1
