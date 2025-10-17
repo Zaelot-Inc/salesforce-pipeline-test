@@ -1,6 +1,5 @@
 name: Build release branch + validate Prod (on PR merged to staging)
 
-# Run when a PR is closed — we'll verify it's merged and target branch is staging
 on:
   pull_request:
     types: [closed]
@@ -9,6 +8,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  checks: write
 
 jobs:
   promote-feature-branch:
@@ -16,10 +16,11 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'staging' }}
     env:
-      # default Prod login if not provided
       SF_LOGIN_URL_PROD: "https://test.salesforce.com"
+    outputs:
+      release_branch: ${{ steps.create_branch.outputs.release_branch }}
+      release_pr_number: ${{ steps.open_pr.outputs.release_pr_number }}
     steps:
-
       - name: Checkout full repo
         uses: actions/checkout@v5
         with:
@@ -37,18 +38,14 @@ jobs:
           echo "PR_HEAD_OWNER=${{ github.event.pull_request.head.repo.owner.login }}" >> $GITHUB_ENV
           echo "PR_HEAD_REPO=${{ github.event.pull_request.head.repo.name }}" >> $GITHUB_ENV
           echo "PR_HEAD_SHA=${{ github.event.pull_request.head.sha }}" >> $GITHUB_ENV
-          echo "PR_CREATED_AT=${{ github.event.pull_request.created_at }}" >> $GITHUB_ENV
-          echo "MERGED_AT=${{ github.event.pull_request.merged_at }}" >> $GITHUB_ENV
 
       - name: Install requirements (sf CLI, sfdx-git-delta, jq, gh)
         run: |
+          set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y jq git curl ca-certificates
-          # Node + sf CLI
           npm i -g @salesforce/cli@latest
-          # install sfdx-git-delta (sf plugin)
           echo y | sf plugins install sfdx-git-delta || true
-          # GitHub CLI (optional; used for comments if available)
           if ! command -v gh >/dev/null 2>&1; then
             curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
               | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
@@ -58,13 +55,19 @@ jobs:
               && sudo apt update && sudo apt install -y gh
           fi
 
+      - name: Ensure Java 11+
+        uses: actions/setup-java@v4
+        with:
+          java-version: '11'
+          distribution: 'zulu'
+
       - name: Fetch origin/main and prepare refs
         run: |
+          set -euo pipefail
           git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git fetch --no-tags origin main:refs/remotes/origin/main
-          # show some info
-          echo "PR #${PR_NUMBER}: head=${PR_HEAD_REF} repo=${PR_HEAD_REPO_FULL} sha=${PR_HEAD_SHA}"
           git rev-parse --verify origin/main
+          echo "PR #${PR_NUMBER}: head=${PR_HEAD_REF} repo=${PR_HEAD_REPO_FULL} sha=${PR_HEAD_SHA}"
 
       - name: Fetch feature branch (supports forks)
         id: fetch_feature
@@ -76,30 +79,26 @@ jobs:
           REPONAME="${PR_HEAD_REPO}"
           BRANCH="${PR_HEAD_REF}"
           PR_NUM="${PR_NUMBER}"
-          echo "Attempting to fetch feature branch '${BRANCH}' from ${OWNER}/${REPONAME} ..."
-          # if same repo just fetch origin
+          echo "Fetching '${BRANCH}' from ${OWNER}/${REPONAME} ..."
+
           if [ "${OWNER}/${REPONAME}" = "${{ github.repository }}" ]; then
-            git fetch origin "refs/heads/${BRANCH}:refs/remotes/pr/${BRANCH}" || {
-              echo "direct fetch from origin failed; trying PR ref fallback..."
+            if ! git fetch origin "refs/heads/${BRANCH}:refs/remotes/pr/${BRANCH}"; then
+              echo "Direct fetch failed; trying PR ref fallback..."
               git fetch origin "refs/pull/${PR_NUM}/head:refs/remotes/pr/${BRANCH}"
-            }
+            fi
           else
-            # fetch from fork by using authenticated URL
-            git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${REPONAME}.git" || true
-            git fetch --no-tags fork "refs/heads/${BRANCH}:refs/remotes/pr/${BRANCH}" || {
-              echo "Fetch from fork failed; trying PR ref fallback..."
-              git fetch origin "refs/pull/${PR_NUM}/head:refs/remotes/pr/${BRANCH}" || true
-            }
+            git remote remove fork 2>/dev/null || true
+            git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${REPONAME}.git"
+            if ! git fetch --no-tags fork "refs/heads/${BRANCH}:refs/remotes/pr/${BRANCH}"; then
+              echo "Fork fetch failed; trying PR ref fallback..."
+              git fetch origin "refs/pull/${PR_NUM}/head:refs/remotes/pr/${BRANCH}"
+            fi
           fi
 
-          # If fetch succeeded, set FETCH_REF to refs/remotes/pr/BRANCH; else fallback to PR head sha
           if git show-ref --verify --quiet "refs/remotes/pr/${BRANCH}"; then
-            echo "Fetched branch into refs/remotes/pr/${BRANCH}"
-            echo "FETCH_REF=refs/remotes/pr/${BRANCH}" >> $GITHUB_OUTPUT
             echo "FETCH_REF=refs/remotes/pr/${BRANCH}" >> $GITHUB_ENV
           else
             echo "Could not fetch branch by name; falling back to PR head SHA ${PR_HEAD_SHA}"
-            echo "FETCH_REF=${PR_HEAD_SHA}" >> $GITHUB_OUTPUT
             echo "FETCH_REF=${PR_HEAD_SHA}" >> $GITHUB_ENV
           fi
 
@@ -115,78 +114,54 @@ jobs:
             --to "${TO_REF}" \
             --output "changed-sources" \
             --generate-delta \
-            --source "force-app/" || true
-          # if nothing under changed-sources/force-app, mark as empty
-          if [ ! -d changed-sources/force-app ] || [ -z "$(ls -A changed-sources/force-app || true)" ]; then
-            echo "no_changes=true" >> $GITHUB_OUTPUT
-            echo "No changed metadata detected between origin/main and ${TO_REF}"
+            --source "force-app/"
+
+          if [ -d changed-sources/force-app ] && [ -n "$(ls -A changed-sources/force-app || true)" ]; then
+            find changed-sources/force-app -type f | sed 's#^changed-sources/##' > changed-files.txt
+            echo "no_changes=false" >> "$GITHUB_OUTPUT"
           else
-            echo "no_changes=false" >> $GITHUB_OUTPUT
-            echo "Delta generated under changed-sources/force-app"
-            # List files (relative repo paths)
-            find changed-sources/force-app -type f | sed 's#changed-sources/##' > changed-files.txt
-            echo "changed_files_list=changed-files.txt" >> $GITHUB_OUTPUT
+            echo "no_changes=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Abort if no metadata changes
         if: steps.gen_delta.outputs.no_changes == 'true'
-        run: |
-          BODY="No deployable metadata detected between \`main\` and feature branch \`${PR_HEAD_REF}\` (PR #${PR_NUMBER}). Nothing to promote."
-          echo "$BODY"
-          # Comment on the original PR (best-effort; GH CLI may be present)
-          if command -v gh >/dev/null 2>&1; then
-            gh pr comment "${PR_NUMBER}" --body "$BODY" || true
-          else
-            echo "gh cli not available — skipping PR comment"
-          fi
-          exit 0
-
-      - name: Fail fast if files changed in main AFTER PR was opened (conflict detection)
-        id: conflict_check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          PR_CREATED="${PR_CREATED_AT}"
-          PR_CRE_TS=$(date -d "$PR_CREATED" +%s)
-          echo "PR created at $PR_CREATED -> epoch $PR_CRE_TS"
-          conflicts_found=false
-          while IFS= read -r repo_file; do
-            # repo_file is like force-app/... ; check last commit on origin/main touching that file
-            if git ls-tree -r --name-only origin/main | grep -xF -- "$repo_file" >/dev/null 2>&1; then
-              last_ts=$(git log -1 --format=%ct origin/main -- "$repo_file" || echo 0)
-            else
-              last_ts=0
-            fi
-            # if last_ts > PR_CRE_TS then main changed that file after PR opened -> potential conflict
-            if [ -n "$last_ts" ] && [ "$last_ts" -gt "$PR_CRE_TS" ]; then
-              echo "Conflict candidate: $repo_file changed on main at $(date -d @$last_ts) which is after PR creation $(date -d @$PR_CRE_TS)"
-              conflicts_found=true
-            fi
-          done < changed-files.txt
+          BODY="No deployable metadata detected between \`main\` and feature branch \`${PR_HEAD_REF}\` (PR #${PR_NUMBER}). Nothing to promote."
+          echo "$BODY"
+          gh pr comment "${PR_NUMBER}" --body "$BODY" || true
+          exit 0
 
-          if [ "$conflicts_found" = "true" ]; then
-            BODY="⛔ *Promotion blocked*: Some files changed on \`main\` after PR #${PR_NUMBER} was opened. This likely creates a conflict if we try to promote only this feature. Please rebase/merge main into the feature branch or resolve conflicts manually.\n\nFiles changed on main after PR creation:\n"
-            # append a short list for the body
-            while IFS= read -r repo_file; do
-              if git ls-tree -r --name-only origin/main | grep -xF -- "$repo_file" >/dev/null 2>&1; then
-                last_ts=$(git log -1 --format=%ct origin/main -- "$repo_file" || echo 0)
-              else
-                last_ts=0
-              fi
-              if [ -n "$last_ts" ] && [ "$last_ts" -gt "$PR_CRE_TS" ]; then
-                BODY="${BODY}- \`${repo_file}\` (main updated: $(date -d @$last_ts))\n"
-              fi
-            done < changed-files.txt
+      - name: Conflict check vs main (merge-base & delta intersection)
+        id: conflict_check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          FEATURE_REF="${FETCH_REF}"
+          MERGE_BASE=$(git merge-base origin/main "${FEATURE_REF}")
+          echo "merge-base: ${MERGE_BASE}"
 
+          git diff --name-only "${MERGE_BASE}" origin/main > files_changed_on_main_since_base.txt
+
+          conflicts=false
+          if [ -s changed-files.txt ] && [ -s files_changed_on_main_since_base.txt ]; then
+            if grep -xF -f changed-files.txt files_changed_on_main_since_base.txt >/dev/null 2>&1; then
+              conflicts=true
+            fi
+          fi
+
+          if [ "${conflicts}" = "true" ]; then
+            BODY="⛔ *Promotion blocked*: Files changed on \`main\` since this branch diverged also appear in the feature delta. Please rebase/merge main into the feature and retry.\n\nOverlap:\n"
+            grep -xF -f changed-files.txt files_changed_on_main_since_base.txt | sed -e 's/^/- `/' -e 's/$/`/' >> /tmp/conflict_list.txt || true
+            [ -s /tmp/conflict_list.txt ] && BODY="${BODY}$(cat /tmp/conflict_list.txt)\n"
             echo "$BODY"
-            # Post comment to PR (best-effort)
-            if command -v gh >/dev/null 2>&1; then
-              gh pr comment "${PR_NUMBER}" --body "$BODY" || true
-            fi
-            echo "conflict=true" >> $GITHUB_OUTPUT
+            gh pr comment "${PR_NUMBER}" --body "$BODY" || true
             exit 1
           else
             echo "No conflicting changes on main detected."
-            echo "conflict=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Create release branch from origin/main
@@ -195,23 +170,26 @@ jobs:
           set -euo pipefail
           SHORTSHA=$(echo "${PR_HEAD_SHA}" | cut -c1-7)
           RELEASE_BRANCH="release/pr-${PR_NUMBER}-${SHORTSHA}"
-          echo "Creating release branch ${RELEASE_BRANCH} from origin/main"
           git checkout -b "${RELEASE_BRANCH}" origin/main
           echo "RELEASE_BRANCH=${RELEASE_BRANCH}" >> $GITHUB_ENV
           echo "release_branch=${RELEASE_BRANCH}" >> $GITHUB_OUTPUT
 
       - name: Copy delta into release branch and commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Copy changed metadata from changed-sources/force-app into the repo's force-app
+          git config --global user.email "augusto@zaelot.com"
+          git config --global user.name "Augusto Presotto"
           rsync -av --delete changed-sources/force-app/ force-app/
           git add -A force-app/
           if git diff --cached --quiet; then
-            echo "No differences to commit after copying delta. Nothing to push."
-            gh pr comment "${PR_NUMBER}" --body "Release creation aborted: no changes to commit on release branch for PR #${PR_NUMBER}." || true
+            MSG="Release creation aborted: no changes to commit on release branch for PR #${PR_NUMBER}."
+            echo "$MSG"
+            gh pr comment "${PR_NUMBER}" --body "$MSG" || true
             exit 0
           fi
-          git commit -m "release: promote PR #${PR_NUMBER} (${PR_HEAD_REF} -> main) [automated]" || true
+          git commit -m "release: promote PR #${PR_NUMBER} (${PR_HEAD_REF} -> main) [automated]"
           git push origin "HEAD:${RELEASE_BRANCH}"
 
       - name: Open PR from release branch into main
@@ -219,32 +197,19 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            const core = require('@actions/core');
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const head = process.env.RELEASE_BRANCH;
             const base = "main";
             const title = `[release] Promote PR #${process.env.PR_NUMBER} -> main: ${process.env.PR_TITLE}`;
             const body = `Automated release PR to promote feature from staging PR #${process.env.PR_NUMBER}.\n\nFeature branch: \`${process.env.PR_HEAD_REF}\`\nFeature head SHA: \`${process.env.PR_HEAD_SHA}\`\n\nThis PR contains only the metadata delta between \`origin/main\` and the feature branch.`;
-            const pr = await github.rest.pulls.create({
-              owner, repo, title, head, base, body, maintainer_can_modify: true
-            });
+            const pr = await github.rest.pulls.create({ owner, repo, title, head, base, body, maintainer_can_modify: true });
             core.info(`Created release PR #${pr.data.number}`);
             core.setOutput('release_pr_number', pr.data.number.toString());
             core.setOutput('release_pr_url', pr.data.html_url);
 
-      - name: Comment original staging PR about release PR
-        if: always()
-        run: |
-          RELEASE_PR_NUMBER=${{ steps.open_pr.outputs.release_pr_number }}
-          RELEASE_PR_URL=${{ steps.open_pr.outputs.release_pr_url }}
-          BODY="✅ Automated release PR created: #${RELEASE_PR_NUMBER} (${RELEASE_PR_URL}). This PR contains only the metadata changes from the feature branch and will be validated against Production (check-only)."
-          echo "$BODY"
-          if command -v gh >/dev/null 2>&1; then
-            gh pr comment "${PR_NUMBER}" --body "$BODY" || true
-          fi
-
       - name: Authenticate to Production (JWT) — write key file
-        if: always()
         env:
           SF_JWT_KEY_PROD: ${{ secrets.SF_JWT_KEY }}
         run: |
@@ -255,10 +220,8 @@ jobs:
           fi
           umask 177
           printf "%s" "$SF_JWT_KEY_PROD" > jwt_prod.key
-          echo "Wrote jwt_prod.key (umask 177)."
 
       - name: Login to Production (JWT)
-        if: always()
         env:
           SF_JWT_CLIENT_PROD: ${{ secrets.SF_JWT_CLIENT }}
           SF_JWT_USERNAME_PROD: ${{ secrets.SF_JWT_USERNAME }}
@@ -276,86 +239,76 @@ jobs:
             --instance-url "${SF_LOGIN_URL_PROD}" \
             --alias ProdForValidation --set-default --json
 
-      - name: Validate-only deploy to Production (check-only) and persist JSON
-        if: always()
+      - name: Validate-only deploy to Production (check-only)
         run: |
           set -euo pipefail
-          # use the changed-sources Dir as the set to validate; you could also create a manifest
           if [ ! -d changed-sources/force-app ]; then
             echo "No changed-sources present to validate; skipping prod validation."
             exit 78
           fi
-          # Deploy check-only (dry-run) against Prod
-          sf project deploy start \
+
+          PROD_VALIDATION_FILE=prod-validate.json
+          if ! sf project deploy start \
             --source-dir "changed-sources/force-app" \
             --target-org ProdForValidation \
             --dry-run \
             --test-level RunLocalTests \
             --wait 120 \
-            --json > prod-validate.json || true
-          echo "Wrote prod-validate.json (may contain failure details)."
+            --json > "${PROD_VALIDATION_FILE}" 2>&1; then
+            echo "sf project deploy returned non-zero; details captured."
+            # fall through to parse JSON/output and fail
+          fi
 
-      - name: Upload prod validation JSON artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: prod-validate-json-pr-${{ env.PR_NUMBER }}
-          path: prod-validate.json
+          if [ -s "${PROD_VALIDATION_FILE}" ] && jq -e . >/dev/null 2>&1 < "${PROD_VALIDATION_FILE}"; then
+            failures=$(jq '.result.details.runTestResult.failures | length // 0' "${PROD_VALIDATION_FILE}" || echo 0)
+            status=$(jq -r '.status // .result.status // "unknown"' "${PROD_VALIDATION_FILE}" || echo "unknown")
+            echo "Validation status: ${status}; failures: ${failures}"
+            if [ "${failures}" -gt 0 ] || [ "${status}" != "Succeeded" -a "${status}" != "success" ]; then
+              exit 1
+            fi
+          else
+            echo "prod-validate.json missing or invalid."
+            exit 1
+          fi
 
-      - name: Summarize validation and post to release PR (best-effort)
-        if: always()
-        uses: actions/github-script@v7
+  rollback-on-failure:
+    name: Roll back release artifacts and notify PR (on failure)
+    needs: promote-feature-branch
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Set context
+        run: |
+          echo "PR_NUMBER=${{ github.event.pull_request.number }}" >> $GITHUB_ENV
+          echo "RELEASE_BRANCH=${{ needs.promote-feature-branch.outputs.release_branch }}" >> $GITHUB_ENV
+          echo "RELEASE_PR_NUMBER=${{ needs.promote-feature-branch.outputs.release_pr_number }}" >> $GITHUB_ENV
+
+      - name: Install gh
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y gh
+
+      - name: Comment failure on original PR
         env:
-          RELEASE_PR_NUMBER: ${{ steps.open_pr.outputs.release_pr_number }}
-        with:
-          script: |
-            const fs = require('fs');
-            const core = require('@actions/core');
-            const owner = context.repo.owner, repo = context.repo.repo;
-            const prNum = parseInt(process.env.PR_NUMBER,10);
-            // read release PR number from env (fallbacks handled below)
-            let releasePrNum = 0;
-            if (process.env.RELEASE_PR_NUMBER) {
-              releasePrNum = parseInt(process.env.RELEASE_PR_NUMBER, 10) || 0;
-            } else if (process.env.RELEASE_PR) {
-              releasePrNum = parseInt(process.env.RELEASE_PR, 10) || 0;
-            } else if (process.env.RELEASE_PR_NUMBER) {
-              releasePrNum = parseInt(process.env.RELEASE_PR_NUMBER, 10) || 0;
-            }
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          MSG="⛔ Release automation failed. Any created artifacts will be cleaned up. Please review the workflow logs."
+          gh pr comment "${PR_NUMBER}" --body "${MSG}" || true
 
-            let body = `### Production validation result for release PR #${releasePrNum || 'TBD'} (origin: PR #${prNum})\n\n`;
-            const file = 'prod-validate.json';
-            if (fs.existsSync(file)) {
-              try {
-                const data = JSON.parse(fs.readFileSync(file,'utf8'));
-                const failures = (((data || {}).result || {}).details || {}).runTestResult?.failures || [];
-                const deployStatus = data?.status || (data?.result?.status) || 'unknown';
-                body += `Validation status: **${deployStatus}**\n\n`;
-                if (failures && failures.length) {
-                  body += `Found **${failures.length}** failing Apex test(s):\n\n| Class | Method | Message |\n|---|---|---|\n`;
-                  for (const f of failures.slice(0,30)) {
-                    const msg = String(f.message || '').replace(/\n/g, ' ').slice(0,500);
-                    body += `| ${f.name} | ${f.methodName} | ${msg} |\n`;
-                  }
-                  body += `\n(Full validation JSON uploaded as artifact)\n`;
-                } else {
-                  body += "No Apex test failures found in the check-only validation.\n";
-                }
-              } catch (e) {
-                body += `Could not parse prod-validate.json: ${e.message}\n`;
-              }
-            } else {
-              body += "No prod-validate.json produced (validation skipped or failed before runtime).\n";
-            }
-            const postTo = releasePrNum || prNum;
-            await github.rest.issues.createComment({
-              owner, repo, issue_number: postTo,
-              body
-            });
+      - name: Close release PR if exists
+        if: ${{ env.RELEASE_PR_NUMBER != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr close "${RELEASE_PR_NUMBER}" --delete-branch || true
 
-            // If validation had failures, mark the workflow as failed
-            const data = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file,'utf8')) : null;
-            const failures = data ? ((((data || {}).result || {}).details || {}).runTestResult?.failures || []) : [];
-            if (failures && failures.length) {
-              core.setFailed(`Prod validation reported ${failures.length} Apex failures.`);
-            }
+      - name: Delete release branch if still present
+        if: ${{ env.RELEASE_BRANCH != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # If the PR close already deleted the branch, this is a no-op
+          gh api -X DELETE repos/${{ github.repository }}/git/refs/heads/${RELEASE_BRANCH} || true
