@@ -107,27 +107,60 @@ jobs:
         id: gen_delta
         run: |
           set -euo pipefail
+          # FETCH_REF should be the fetched ref for the feature branch (ref or SHA)
           TO_REF="${FETCH_REF}"
-          echo "Generating delta: origin/main -> ${TO_REF}"
-          mkdir -p changed-sources
-          sf sgd source delta \
-            --from "origin/main" \
-            --to "${TO_REF}" \
-            --output "changed-sources" \
-            --generate-delta \
-            --source "force-app/" || true
-          # if nothing under changed-sources/force-app, mark as empty
-          if [ ! -d changed-sources/force-app ] || [ -z "$(ls -A changed-sources/force-app || true)" ]; then
-            echo "no_changes=true" >> $GITHUB_OUTPUT
-            echo "No changed metadata detected between origin/main and ${TO_REF}"
-          else
-            echo "no_changes=false" >> $GITHUB_OUTPUT
-            echo "Delta generated under changed-sources/force-app"
-            # List files (relative repo paths)
+          echo "Computing conflicts using merge-base: origin/main -> ${TO_REF}"
+          # Ensure the feature ref is available locally (ref or sha)
+          # If FETCH_REF is a ref like refs/remotes/pr/branch use it; if it's a SHA use that SHA directly.
+          FEATURE_REF="${TO_REF}"
+          # compute merge-base
+          MERGE_BASE=$(git merge-base origin/main "${FEATURE_REF}") || {
+            echo "Could not compute merge-base between origin/main and ${FEATURE_REF}"
+            exit 1
+          }
+          echo "merge-base: ${MERGE_BASE}"
+
+          # 1) files changed on main since merge-base
+          git diff --name-only "${MERGE_BASE}" origin/main > files_changed_on_main_since_base.txt
+
+          # 2) files in the delta we plan to apply (generated earlier)
+          # changed-files.txt must exist (we created it after sgd). If not, create it similarly:
+          if [ ! -f changed-files.txt ]; then
             find changed-sources/force-app -type f | sed 's#changed-sources/##' > changed-files.txt
-            echo "changed_files_list=changed-files.txt" >> $GITHUB_OUTPUT
           fi
 
+          # 3) intersect the lists
+          conflicts=false
+          echo "Checking intersection between changed-files.txt and changes on main since merge-base..."
+          if [ -s files_changed_on_main_since_base.txt ]; then
+            # normalize paths and compare
+            while IFS= read -r f; do
+              # exact match: file present in main-changes
+              if grep -xF -- "$f" files_changed_on_main_since_base.txt >/dev/null 2>&1; then
+                echo "Conflict candidate (both changed): $f"
+                conflicts=true
+              fi
+            done < changed-files.txt
+          fi
+
+          if [ "$conflicts" = "true" ]; then
+            BODY="⛔ *Promotion blocked*: Files changed on \`main\` since this PR diverged; promote only after resolving conflicts.\n\nFiles:\n"
+            # append the intersecting files for the PR comment body
+            grep -xF -f changed-files.txt files_changed_on_main_since_base.txt | sed 's/^/- /' | sed -e 's/^/- `/' -e 's/$/`/' >> /tmp/conflict_list.txt || true
+            if [ -s /tmp/conflict_list.txt ]; then
+              BODY="${BODY}$(cat /tmp/conflict_list.txt)\n"
+            fi
+            echo "$BODY"
+            if command -v gh >/dev/null 2>&1; then
+              gh pr comment "${PR_NUMBER}" --body "$BODY" || true
+            fi
+            # fail the job so human resolve
+            echo "conflict=true" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "No conflicting changes on main detected (merge-base method)."
+            echo "conflict=false" >> $GITHUB_OUTPUT
+          fi
       - name: Abort if no metadata changes
         if: steps.gen_delta.outputs.no_changes == 'true'
         run: |
