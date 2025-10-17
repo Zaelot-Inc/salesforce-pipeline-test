@@ -310,7 +310,6 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const core = require('@actions/core');
             const owner = context.repo.owner, repo = context.repo.repo;
             const prNum = parseInt(process.env.PR_NUMBER,10);
             // read release PR number from env (fallbacks handled below)
