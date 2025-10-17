@@ -203,6 +203,8 @@ jobs:
       - name: Copy delta into release branch and commit
         run: |
           set -euo pipefail
+          git config --global user.email "augusto@zaelot.com"
+          git config --global user.name "Augusto Presotto"
           # Copy changed metadata from changed-sources/force-app into the repo's force-app
           rsync -av --delete changed-sources/force-app/ force-app/
           git add -A force-app/
