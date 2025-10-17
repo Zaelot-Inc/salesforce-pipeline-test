@@ -1,3 +1,3 @@
 public without sharing class Testing {
-    string t = 'Vamos Class';
+    string t = 'Vamos Class con todo esto';
 }

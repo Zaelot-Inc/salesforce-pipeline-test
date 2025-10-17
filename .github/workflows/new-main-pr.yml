@@ -1,0 +1,178 @@
+name: Validate release PR against Production (check-only)
+
+on:
+  pull_request:
+    branches: [ main ]
+    types: [ opened, reopened, synchronize ]
+    paths:
+      - 'force-app/**'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: 'prod-validate-pr-${{ github.event.pull_request.number }}'
+  cancel-in-progress: true
+
+jobs:
+  prod-validate:
+    name: Prod validate-only (origin/main -> PR head)
+    runs-on: ubuntu-latest
+    env:
+      SF_LOGIN_URL_PROD: "https://test.salesforce.com"
+
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install requirements (sf CLI, sfdx-git-delta, jq)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y jq git curl ca-certificates
+          npm i -g @salesforce/cli@latest
+          echo y | sf plugins install sfdx-git-delta || true
+
+      - name: Ensure Java 11+
+        uses: actions/setup-java@v4
+        with:
+          java-version: '11'
+          distribution: 'zulu'
+
+      - name: Prepare refs (origin/main)
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git rev-parse --verify origin/main
+          echo "HEAD of PR: ${{ github.event.pull_request.head.sha }}"
+
+      - name: Generate delta (origin/main -> PR head)
+        id: delta
+        run: |
+          set -euo pipefail
+          TO_SHA="${{ github.event.pull_request.head.sha }}"
+          echo "Generating delta: origin/main -> ${TO_SHA}"
+          mkdir -p changed-sources
+          sf sgd source delta \
+            --from "origin/main" \
+            --to "${TO_SHA}" \
+            --output "changed-sources" \
+            --generate-delta \
+            --source "force-app/"
+
+          if [ -d changed-sources/force-app ] && [ -n "$(ls -A changed-sources/force-app || true)" ]; then
+            echo "no_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "no_changes=true" >> "$GITHUB_OUTPUT"
+
+      - name: Early exit if no metadata changes
+        if: steps.delta.outputs.no_changes == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner, repo = context.repo.repo;
+            const number = context.payload.pull_request.number;
+            const body = "ℹ️ No deployable metadata differences detected between `main` and this PR — skipping Production validation.";
+            await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
+
+      - name: Write Prod JWT key
+        if: steps.delta.outputs.no_changes != 'true'
+        env:
+          SF_JWT_KEY_PROD: ${{ secrets.SF_JWT_KEY }}
+        run: |
+          set -euo pipefail
+          [ -z "${SF_JWT_KEY_PROD:-}" ] && { echo "SF_JWT_KEY_PROD missing"; exit 1; }
+          umask 177
+          printf "%s" "$SF_JWT_KEY_PROD" > jwt_prod.key
+
+      - name: Login to Production (JWT)
+        if: steps.delta.outputs.no_changes != 'true'
+        env:
+          SF_JWT_CLIENT_PROD: ${{ secrets.SF_JWT_CLIENT }}
+          SF_JWT_USERNAME_PROD: ${{ secrets.SF_JWT_USERNAME }}
+        run: |
+          set -euo pipefail
+          sf org login jwt \
+            --username "$SF_JWT_USERNAME_PROD" \
+            --client-id "$SF_JWT_CLIENT_PROD" \
+            --jwt-key-file jwt_prod.key \
+            --instance-url "${SF_LOGIN_URL_PROD}" \
+            --alias ProdForValidation --set-default --json
+
+      - name: Validate-only deploy to Production (check-only) and persist JSON
+        if: steps.delta.outputs.no_changes != 'true'
+        run: |
+          set -euo pipefail
+          PROD_VALIDATION_FILE=prod-validate.json
+          sf project deploy start \
+            --source-dir "changed-sources/force-app" \
+            --target-org ProdForValidation \
+            --dry-run \
+            --test-level RunLocalTests \
+            --wait 120 \
+            --json > "${PROD_VALIDATION_FILE}"
+
+          # Basic summary to logs
+          if [ -s "${PROD_VALIDATION_FILE}" ] && jq -e . >/dev/null 2>&1 < "${PROD_VALIDATION_FILE}"; then
+            status=$(jq -r '.status // .result.status // "unknown"' "${PROD_VALIDATION_FILE}" || echo "unknown")
+            failures=$(jq '.result.details.runTestResult.failures | length // 0' "${PROD_VALIDATION_FILE}" || echo 0)
+            echo "Validation status: ${status}; failures: ${failures}"
+          else
+            echo "prod-validate.json missing/invalid"; exit 1
+          fi
+
+      - name: Upload prod validation JSON artifact
+        if: steps.delta.outputs.no_changes != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-validate-json-pr-${{ github.event.pull_request.number }}
+          path: prod-validate.json
+
+      - name: Comment results on the PR and fail on test errors
+        if: steps.delta.outputs.no_changes != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const owner = context.repo.owner, repo = context.repo.repo;
+            const number = context.payload.pull_request.number;
+            const file = 'prod-validate.json';
+
+            let body = "### Production validation result\n\n";
+            if (fs.existsSync(file)) {
+              try {
+                const data = JSON.parse(fs.readFileSync(file,'utf8'));
+                const failures = (((data || {}).result || {}).details || {}).runTestResult?.failures || [];
+                const deployStatus = data?.status || (data?.result?.status) || 'unknown';
+                body += `Status: **${deployStatus}**\n\n`;
+                if (failures.length) {
+                  body += `Found **${failures.length}** failing Apex test(s):\n\n| Class | Method | Message |\n|---|---|---|\n`;
+                  for (const f of failures.slice(0,30)) {
+                    const msg = String(f.message || '').replace(/\n/g, ' ').slice(0,500);
+                    body += `| ${f.name} | ${f.methodName} | ${msg} |\n`;
+                  }
+                  body += `\n(Full validation JSON uploaded as artifact)\n`;
+                } else {
+                  body += "No Apex test failures found.\n";
+                }
+                await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
+                if (failures.length) {
+                  core.setFailed(`Prod validation reported ${failures.length} Apex failures.`);
+                }
+              } catch (e) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: number,
+                  body: `Could not parse prod-validate.json: ${e.message}`
+                });
+                core.setFailed('Invalid validation JSON.');
+              }
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: number,
+                body: "No prod-validate.json produced; check workflow logs."
+              });
+              core.setFailed('No validation JSON produced.');
+            }
