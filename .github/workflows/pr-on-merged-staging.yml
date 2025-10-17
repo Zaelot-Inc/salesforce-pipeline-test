@@ -208,7 +208,19 @@ jobs:
             core.setOutput('release_pr_number', pr.data.number.toString());
             core.setOutput('release_pr_url', pr.data.html_url);
 
+      - name: Comment original staging PR about release PR
+        if: always()
+        run: |
+          RELEASE_PR_NUMBER=${{ steps.open_pr.outputs.release_pr_number }}
+          RELEASE_PR_URL=${{ steps.open_pr.outputs.release_pr_url }}
+          BODY="✅ Automated release PR created: #${RELEASE_PR_NUMBER} (${RELEASE_PR_URL}). This PR contains only the metadata changes from the feature branch and will be validated against Production (check-only)."
+          echo "$BODY"
+          if command -v gh >/dev/null 2>&1; then
+            gh pr comment "${PR_NUMBER}" --body "$BODY" || true
+          fi
+
       - name: Authenticate to Production (JWT) — write key file
+        if: always()
         env:
           SF_JWT_KEY_PROD: ${{ secrets.SF_JWT_KEY }}
         run: |
@@ -219,8 +231,10 @@ jobs:
           fi
           umask 177
           printf "%s" "$SF_JWT_KEY_PROD" > jwt_prod.key
+          echo "Wrote jwt_prod.key (umask 177)."
 
       - name: Login to Production (JWT)
+        if: always()
         env:
           SF_JWT_CLIENT_PROD: ${{ secrets.SF_JWT_CLIENT }}
           SF_JWT_USERNAME_PROD: ${{ secrets.SF_JWT_USERNAME }}
@@ -238,51 +252,92 @@ jobs:
             --instance-url "${SF_LOGIN_URL_PROD}" \
             --alias ProdForValidation --set-default --json
 
-      - name: Validate-only deploy to Production (check-only)
+      - name: Validate-only deploy to Production (check-only) and persist JSON
+        if: always()
         run: |
           set -euo pipefail
           if [ ! -d changed-sources/force-app ]; then
             echo "No changed-sources present to validate; skipping prod validation."
             exit 78
           fi
-
-          PROD_VALIDATION_FILE=prod-validate.json
-          if ! sf project deploy start \
+          sf project deploy start \
             --source-dir "changed-sources/force-app" \
             --target-org ProdForValidation \
             --dry-run \
             --test-level RunLocalTests \
             --wait 120 \
-            --json > "${PROD_VALIDATION_FILE}" 2>&1; then
-            echo "sf project deploy returned non-zero; details captured."
-            # fall through to parse JSON/output and fail
-          fi
+            --json > prod-validate.json || true
+          echo "Wrote prod-validate.json (may contain failure details)."
 
-          if [ -s "${PROD_VALIDATION_FILE}" ] && jq -e . >/dev/null 2>&1 < "${PROD_VALIDATION_FILE}"; then
-            failures=$(jq '.result.details.runTestResult.failures | length // 0' "${PROD_VALIDATION_FILE}" || echo 0)
-            status=$(jq -r '.status // .result.status // "unknown"' "${PROD_VALIDATION_FILE}" || echo "unknown")
-            echo "Validation status: ${status}; failures: ${failures}"
-            if [ "${failures}" -gt 0 ] || [ "${status}" != "Succeeded" -a "${status}" != "success" ]; then
-              exit 1
-            fi
-          else
-            echo "prod-validate.json missing or invalid."
-            exit 1
-          fi
+      - name: Upload prod validation JSON artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-validate-json-pr-${{ env.PR_NUMBER }}
+          path: prod-validate.json
 
-  rollback-on-failure:
-    name: Roll back release artifacts and notify PR (on failure)
+      - name: Summarize validation and post to release PR (best-effort)
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          RELEASE_PR_NUMBER: ${{ steps.open_pr.outputs.release_pr_number }}
+        with:
+          script: |
+            const fs = require('fs');
+            const owner = context.repo.owner, repo = context.repo.repo;
+            const prNum = parseInt(process.env.PR_NUMBER,10);
+            let releasePrNum = 0;
+            if (process.env.RELEASE_PR_NUMBER) {
+              releasePrNum = parseInt(process.env.RELEASE_PR_NUMBER, 10) || 0;
+            }
+            let body = `### Production validation result for release PR #${releasePrNum || 'TBD'} (origin: PR #${prNum})\n\n`;
+            const file = 'prod-validate.json';
+            if (fs.existsSync(file)) {
+              try {
+                const data = JSON.parse(fs.readFileSync(file,'utf8'));
+                const failures = (((data || {}).result || {}).details || {}).runTestResult?.failures || [];
+                const deployStatus = data?.status || (data?.result?.status) || 'unknown';
+                body += `Validation status: **${deployStatus}**\n\n`;
+                if (failures && failures.length) {
+                  body += `Found **${failures.length}** failing Apex test(s):\n\n| Class | Method | Message |\n|---|---|---|\n`;
+                  for (const f of failures.slice(0,30)) {
+                    const msg = String(f.message || '').replace(/\n/g, ' ').slice(0,500);
+                    body += `| ${f.name} | ${f.methodName} | ${msg} |\n`;
+                  }
+                  body += `\n(Full validation JSON uploaded as artifact)\n`;
+                } else {
+                  body += "No Apex test failures found in the check-only validation.\n";
+                }
+              } catch (e) {
+                body += `Could not parse prod-validate.json: ${e.message}\n`;
+              }
+            } else {
+              body += "No prod-validate.json produced (validation skipped or failed before runtime).\n";
+            }
+            const postTo = releasePrNum || prNum;
+            await github.rest.issues.createComment({ owner, repo, issue_number: postTo, body });
+
+            // If validation had failures, mark the workflow as failed (so the next job can detect failure())
+            if (fs.existsSync(file)) {
+              const data = JSON.parse(fs.readFileSync(file,'utf8'));
+              const failures = ((((data || {}).result || {}).details || {}).runTestResult?.failures) || [];
+              if (failures.length) {
+                core.setFailed(`Prod validation reported ${failures.length} Apex failures.`);
+              }
+            }
+
+  # Last step on failure: just comment the failure, keep release PR OPEN (no closes/deletes)
+  comment-failure-keep-pr-open:
+    name: Comment failure (keep release PR open for manual merge)
     needs: promote-feature-branch
     if: failure()
     runs-on: ubuntu-latest
     permissions:
-      contents: write
       pull-requests: write
     steps:
-      - name: Set context
+      - name: Rehydrate context
         run: |
           echo "PR_NUMBER=${{ github.event.pull_request.number }}" >> $GITHUB_ENV
-          echo "RELEASE_BRANCH=${{ needs.promote-feature-branch.outputs.release_branch }}" >> $GITHUB_ENV
           echo "RELEASE_PR_NUMBER=${{ needs.promote-feature-branch.outputs.release_pr_number }}" >> $GITHUB_ENV
 
       - name: Install gh
@@ -290,24 +345,14 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y gh
 
-      - name: Comment failure on original PR
+      - name: Comment failure on release PR (or original PR if missing)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          MSG="⛔ Release automation failed. Any created artifacts will be cleaned up. Please review the workflow logs."
-          gh pr comment "${PR_NUMBER}" --body "${MSG}" || true
-
-      - name: Close release PR if exists
-        if: ${{ env.RELEASE_PR_NUMBER != '' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh pr close "${RELEASE_PR_NUMBER}" --delete-branch || true
-
-      - name: Delete release branch if still present
-        if: ${{ env.RELEASE_BRANCH != '' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # If the PR close already deleted the branch, this is a no-op
-          gh api -X DELETE repos/${{ github.repository }}/git/refs/heads/${RELEASE_BRANCH} || true
+          set -euo pipefail
+          MSG="❌ Release automation failed. The release PR remains **open** for manual merge after fixes. See the summary comment above and the uploaded prod-validate.json artifact for details."
+          if [ -n "${RELEASE_PR_NUMBER:-}" ]; then
+            gh pr comment "${RELEASE_PR_NUMBER}" --body "${MSG}" || true
+          else
+            gh pr comment "${PR_NUMBER}" --body "${MSG}" || true
+          fi
