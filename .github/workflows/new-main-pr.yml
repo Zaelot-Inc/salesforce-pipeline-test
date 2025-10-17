@@ -3,9 +3,8 @@ name: Validate release PR against Production (check-only)
 on:
   pull_request:
     branches: [ main ]
-    types: [ opened, reopened, synchronize ]
-    paths:
-      - 'force-app/**'
+    types: [ opened, reopened, synchronize, ready_for_review ]
+    # this filter already helps, but we also add a runtime guard below
 
 permissions:
   contents: read
@@ -28,7 +27,35 @@ jobs:
         with:
           fetch-depth: 0
 
+      # NEW: detect whether the PR actually touches force-app/**
+      - name: Detect force-app changes
+        id: touched
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const number = context.payload.pull_request.number;
+            const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: number, per_page: 100 });
+            const hasForceApp = files.some(f => f.filename.startsWith('force-app/'));
+            core.setOutput('has_force_app', hasForceApp ? 'true' : 'false');
+
+      # If NO force-app changes, succeed and stop
+      - name:  no force-app changes (success)
+        if: steps.touched.outputs.has_force_app != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: "ℹ️ Skipping Production validation: this PR does not touch `force-app/**`."
+            });
+            // success by default (no failure)
+
       - name: Install requirements (sf CLI, sfdx-git-delta, jq)
+        if: steps.touched.outputs.has_force_app == 'true'
         run: |
           set -euo pipefail
           sudo apt-get update -y
@@ -37,12 +64,14 @@ jobs:
           echo y | sf plugins install sfdx-git-delta || true
 
       - name: Ensure Java 11+
+        if: steps.touched.outputs.has_force_app == 'true'
         uses: actions/setup-java@v4
         with:
           java-version: '11'
           distribution: 'zulu'
 
       - name: Prepare refs (origin/main)
+        if: steps.touched.outputs.has_force_app == 'true'
         run: |
           set -euo pipefail
           git fetch --no-tags origin main:refs/remotes/origin/main
@@ -50,6 +79,7 @@ jobs:
           echo "HEAD of PR: ${{ github.event.pull_request.head.sha }}"
 
       - name: Generate delta (origin/main -> PR head)
+        if: steps.touched.outputs.has_force_app == 'true'
         id: delta
         run: |
           set -euo pipefail
@@ -70,7 +100,7 @@ jobs:
           fi
 
       - name: Early exit if no metadata changes
-        if: steps.delta.outputs.no_changes == 'true'
+        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes == 'true'
         uses: actions/github-script@v7
         with:
           script: |
@@ -80,7 +110,7 @@ jobs:
             await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
 
       - name: Write Prod JWT key
-        if: steps.delta.outputs.no_changes != 'true'
+        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
         env:
           SF_JWT_KEY_PROD: ${{ secrets.SF_JWT_KEY }}
         run: |
@@ -90,7 +120,7 @@ jobs:
           printf "%s" "$SF_JWT_KEY_PROD" > jwt_prod.key
 
       - name: Login to Production (JWT)
-        if: steps.delta.outputs.no_changes != 'true'
+        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
         env:
           SF_JWT_CLIENT_PROD: ${{ secrets.SF_JWT_CLIENT }}
           SF_JWT_USERNAME_PROD: ${{ secrets.SF_JWT_USERNAME }}
@@ -104,7 +134,7 @@ jobs:
             --alias ProdForValidation --set-default --json
 
       - name: Validate-only deploy to Production (check-only) and persist JSON
-        if: steps.delta.outputs.no_changes != 'true'
+        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
         run: |
           set -euo pipefail
           PROD_VALIDATION_FILE=prod-validate.json
@@ -116,7 +146,6 @@ jobs:
             --wait 120 \
             --json > "${PROD_VALIDATION_FILE}"
 
-          # Basic summary to logs
           if [ -s "${PROD_VALIDATION_FILE}" ] && jq -e . >/dev/null 2>&1 < "${PROD_VALIDATION_FILE}"; then
             status=$(jq -r '.status // .result.status // "unknown"' "${PROD_VALIDATION_FILE}" || echo "unknown")
             failures=$(jq '.result.details.runTestResult.failures | length // 0' "${PROD_VALIDATION_FILE}" || echo 0)
@@ -126,14 +155,14 @@ jobs:
           fi
 
       - name: Upload prod validation JSON artifact
-        if: steps.delta.outputs.no_changes != 'true'
+        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: prod-validate-json-pr-${{ github.event.pull_request.number }}
           path: prod-validate.json
 
       - name: Comment results on the PR and fail on test errors
-        if: steps.delta.outputs.no_changes != 'true'
+        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
         uses: actions/github-script@v7
         with:
           script: |
