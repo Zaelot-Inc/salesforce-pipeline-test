@@ -152,42 +152,48 @@ jobs:
             --instance-url "${SF_LOGIN_URL_PROD}" \
             --alias ProdForValidation --set-default --json
 
-      - name: Validate deployment to Production (Quick Deploy–ready) and persist JSON + ID
+      # 1) Run validation with full capture and produce a comment body
+      - name: Validate-only deploy to Production (capture & summarize)
         id: prod_validate
-        if: steps.outputs.skip_process != 'true'
-        # make sure this step uses bash
         shell: bash
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          # Safe, traceable bash
           set -Eeuo pipefail
-          export TZ=UTC
-          PS4='+ [${BASH_SOURCE##*/}:${LINENO}] '
-          set -x
-          trap 'rc=$?; echo "::error::Failed at ${BASH_SOURCE##*/}:${LINENO} running: ${BASH_COMMAND} (exit $rc)"; exit $rc' ERR
+          PS4='+ [${BASH_SOURCE##*/}:${LINENO}] '; set -x
 
-          echo "::group::Preflight"
-          echo "PWD=$(pwd)"
-          command -v sf && sf --version || true
-          command -v jq && jq --version || true
-          ls -R changed-sources || echo "No changed-sources dir yet"
-          echo "::endgroup::"
+          # --- Detect what we have to validate ---
+          HAS_ADDMODS=0; HAS_PRE=0; HAS_POST=0
+          if [ -d "changed-sources/force-app" ] && [ -n "$(ls -A changed-sources/force-app || true)" ]; then HAS_ADDMODS=1; fi
+          [ -s "changed-sources/destructiveChanges/destructiveChanges.xml" ] && HAS_PRE=1 || true
+          [ -s "changed-sources/destructiveChangesPost/destructiveChanges.xml" ] && HAS_POST=1 || true
 
-          # Ensure a manifest exists (needed especially for destructive-only changes)
+          # Ensure a minimal manifest (needed for destructive-only)
           if [ ! -f "changed-sources/package/package.xml" ]; then
-            mkdir -p "changed-sources/package"
+            mkdir -p changed-sources/package
             API_VER="$(jq -r '.sourceApiVersion // .packageDirectories[0].versionNumber // empty' sfdx-project.json 2>/dev/null || true)"
             API_VER="${API_VER:-60.0}"
             printf '%s\n' \
               '<?xml version="1.0" encoding="UTF-8"?>' \
               '<Package xmlns="http://soap.sforce.com/2006/04/metadata">' \
               "  <version>${API_VER}</version>" \
-              '</Package>' > "changed-sources/package/package.xml"
-            echo "Created changed-sources/package/package.xml (API ${API_VER})"
-          else
-            echo "Using existing changed-sources/package/package.xml"
+              '</Package>' > changed-sources/package/package.xml
           fi
 
-          # Build flags: validate full set (adds/mods + optional destructive)
+          # If truly nothing to validate, short-circuit success and generate comment
+          if [ "$HAS_ADDMODS" -eq 0 ] && [ "$HAS_PRE" -eq 0 ] && [ "$HAS_POST" -eq 0 ]; then
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Production validation"
+              echo ""
+              echo "ℹ️ Skipped: This PR does not introduce deployable metadata (no additions/modifications) and has no destructive changes."
+            } > pr-comment.md
+            printf '' > prod-validate.json
+            printf '' > sf-validate.stderr
+            exit 0
+          fi
+
+          # Build flags
           flags=(
             --target-org ProdForValidation
             --test-level RunLocalTests
@@ -195,116 +201,96 @@ jobs:
             --json
             --manifest "changed-sources/package/package.xml"
           )
+          [ "$HAS_PRE"  -eq 1 ] && flags+=( --pre-destructive-changes  "changed-sources/destructiveChanges/destructiveChanges.xml" )
+          [ "$HAS_POST" -eq 1 ] && flags+=( --post-destructive-changes "changed-sources/destructiveChangesPost/destructiveChanges.xml" )
 
-          # If sfdx-git-delta produced destructive manifests, include them in the same validation
-          if [ -f "changed-sources/destructiveChanges/destructiveChanges.xml" ]; then
-            flags+=( --pre-destructive-changes "changed-sources/destructiveChanges/destructiveChanges.xml" )
-          fi
-          if [ -f "changed-sources/destructiveChangesPost/destructiveChanges.xml" ]; then
-            flags+=( --post-destructive-changes "changed-sources/destructiveChangesPost/destructiveChanges.xml" )
-          fi
-
-          echo "::group::Run validation"
-          # Run validate but do NOT let a non-zero exit kill the step yet; capture both streams
+          # --- Run validation (do NOT abort on non-zero) ---
           set +e
-          sf project deploy validate "${flags[@]}" --verbose > "prod-validate.json" 2> "sf-validate.stderr"
-          rc=$?
+          sf project deploy validate "${flags[@]}" --verbose > prod-validate.json 2> sf-validate.stderr
+          RC=$?
           set -e
-          echo "sf project deploy validate exit code: ${rc}"
-          echo "::endgroup::"
+          echo "rc=${RC}" >> "$GITHUB_OUTPUT"
 
-          echo "::group::Parse/diagnose results"
-          # If JSON looks valid, parse it; otherwise show stderr and fail clearly
-          if jq -e . >/dev/null 2>&1 < "prod-validate.json"; then
-            VALIDATE_ID="$(jq -r '.id // .result.id // empty' "prod-validate.json" 2>/dev/null || true)"
-            status="$(jq -r '.status // .result.status // "unknown"' "prod-validate.json" 2>/dev/null || echo "unknown")"
-            failures="$(jq '.result.details.runTestResult.failures | length // 0' "prod-validate.json" 2>/dev/null || echo 0)"
+          # Parse JSON when present; otherwise we’ll show stderr
+          JSON_OK=0
+          if jq -e . >/dev/null 2>&1 < prod-validate.json; then JSON_OK=1; fi
+          echo "json_ok=${JSON_OK}" >> "$GITHUB_OUTPUT"
+
+          VALIDATE_ID="$(jq -r '.id // .result.id // empty' prod-validate.json 2>/dev/null || true)"
+          STATUS="$(jq -r '.status // .result.status // "unknown"' prod-validate.json 2>/dev/null || echo "unknown")"
+          FAILURES="$(jq '.result.details.runTestResult.failures | length // 0' prod-validate.json 2>/dev/null || echo 0)"
+
+          echo "validate_id=${VALIDATE_ID}" >> "$GITHUB_OUTPUT"
+          echo "status=${STATUS}" >> "$GITHUB_OUTPUT"
+          echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
+
+          # Build a Markdown comment body with the best info we have
+          {
+            echo "### Production validation"
+            echo ""
+            if [ "$JSON_OK" -eq 1 ]; then
+              echo "**Status:** \`${STATUS}\`  •  **Apex failures:** \`${FAILURES}\`"
+              echo ""
+              if [ "$FAILURES" -gt 0 ]; then
+                echo "| Class | Method | Message |"
+                echo "|---|---|---|"
+                jq -r '
+                  (((.result.details.runTestResult.failures // []) | .[0:30]) // [])
+                  | .[] | [(.name // "-"), (.methodName // "-"),
+                    ((.message // "" | gsub("\n"; " ") | .[0:500]))] | @tsv
+                ' prod-validate.json | awk -F'\t' '{printf("| %s | %s | %s |\n",$1,$2,$3)}'
+                echo ""
+                echo "_(Full JSON attached as artifact)_"
+              else
+                echo "No Apex test failures reported."
+              fi
+            else
+              echo "**Status:** \`unknown\`  •  CLI returned a non-JSON error. See excerpt below."
+              echo ""
+              echo "#### CLI error (first 200 lines)"
+              echo '```'
+              sed -n '1,200p' sf-validate.stderr || true
+              echo '```'
+            fi
+          } > pr-comment.md
+
+          # If you want to fail the job on validation error or test failures, do it here after writing outputs/comment.
+          if [ "$RC" -ne 0 ]; then
+            echo "will_fail=true" >> "$GITHUB_OUTPUT"
+          elif [ "$FAILURES" -gt 0 ]; then
+            echo "will_fail=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::prod-validate.json is not valid JSON. Dumping sf-validate.stderr (first 200 lines):"
-            sed -n '1,200p' sf-validate.stderr || true
-            echo "::error::Salesforce CLI did not produce valid JSON. See stderr above."
-            exit 1
+            echo "will_fail=false" >> "$GITHUB_OUTPUT"
           fi
 
-          # Expose outputs for later steps
-          echo "validate_id=${VALIDATE_ID}" >> "$GITHUB_OUTPUT"
-          printf '%s' "${VALIDATE_ID:-}" > "prod-validate-id.txt" || true
-          echo "status=${status}"   >> "$GITHUB_OUTPUT"
-          echo "failures=${failures}" >> "$GITHUB_OUTPUT"
-
-          # Brief summary to logs
-          echo "Validation status: ${status}; failures: ${failures}"
-
-          # If the CLI exited non-zero but still produced JSON, we keep going and let callers decide.
-          # If you want to fail here on test failures, uncomment:
-          # if [[ "${failures}" -gt 0 ]]; then
-          #   echo "::error::Apex test failures: ${failures}"
-          #   exit 1
-          # fi
-          echo "::endgroup::"
-
-
-      - name: Upload prod validation JSON artifacts
-        if: steps.outputs.skip_process != 'true'
+      # 2) Upload artifacts so you can inspect locally
+      - name: Upload validation artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: prod-validate-pr-${{ github.event.pull_request.number }}
+          name: prod-validation-${{ github.event.pull_request.number }}
           path: |
             prod-validate.json
-            prod-validate-id.txt
+            sf-validate.stderr
+            pr-comment.md
 
-
-      - name: Comment results on the PR and fail on test errors
-        if: steps.outputs.skip_process != 'true'
+      # 3) Post the result to the PR and (optionally) fail the job
+      - name: Comment results on PR
+        if: always()
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
             const owner = context.repo.owner, repo = context.repo.repo;
             const number = context.payload.pull_request.number;
-
-            const file = 'prod-validate.json';
-            const idPath = 'prod-validate-id.txt';
-            let body = "### Production validation result (Quick Deploy–ready)\n\n";
-
-            let validateId = '';
-            if (fs.existsSync(idPath)) {
-              validateId = fs.readFileSync(idPath, 'utf8').trim();
-            }
-
-            let failures = [];
-            let deployStatus = 'unknown';
-            if (fs.existsSync(file)) {
-              try {
-                const data = JSON.parse(fs.readFileSync(file,'utf8'));
-                failures = (((data || {}).result || {}).details || {}).runTestResult?.failures || [];
-                deployStatus = data?.status || (data?.result?.status) || 'unknown';
-              } catch (e) {
-                body += `Could not parse prod-validate.json: ${e.message}\n\n`;
-              }
-            } else {
-              body += "No prod-validate.json produced; check workflow logs.\n\n";
-            }
-
-            body += `Status: **${deployStatus}**\n\n`;
-            if (validateId) {
-              body += `**Validation ID:** \`${validateId}\`\n\n`;
-              body += `You can Quick Deploy later with:\n\n`;
-              body += "```bash\n";
-              body += `sf project deploy quick --target-org ProdForValidation --job-id ${validateId} --wait 120 --json\n`;
-              body += "```\n\n";
-            }
-
-            if (failures.length) {
-              body += `Found **${failures.length}** failing Apex test(s):\n\n| Class | Method | Message |\n|---|---|---|\n`;
-              for (const f of failures.slice(0,30)) {
-                const msg = String(f.message || '').replace(/\n/g, ' ').slice(0,500);
-                body += `| ${f.name} | ${f.methodName} | ${msg} |\n`;
-              }
-              body += `\n(Full validation JSON uploaded as artifact.)\n`;
-            } else {
-              body += "No Apex test failures found.\n";
-            }
-
+            const body = fs.existsSync('pr-comment.md')
+              ? fs.readFileSync('pr-comment.md','utf8')
+              : 'Production validation ran but no summary was produced.';
             await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
-            if (failures.length) core.setFailed(`Prod validation reported ${failures.length} Apex failures.`);
+
+            // Fail the job if the validator said so (keeps the PR comment posted)
+            const core = require('@actions/core');
+            const willFail = "${{ steps.prod_validate.outputs.will_fail }}";
+            if (willFail === 'true') {
+              core.setFailed('Production validation reported failures or CLI error. See comment above and artifacts.');
+            }
