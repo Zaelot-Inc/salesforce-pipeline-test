@@ -154,31 +154,32 @@ jobs:
 
       - name: Validate deployment to Production (Quick Deploy–ready) and persist JSON + ID
         id: prod_validate
-        shell: bash
         if: steps.outputs.skip_process != 'true'
+        # make sure this step uses bash
+        shell: bash
         run: |
           set -euo pipefail
 
           # Ensure a manifest exists (needed especially for destructive-only changes)
           if [ ! -f "changed-sources/package/package.xml" ]; then
-            mkdir -p changed-sources/package
-            API_VER=$(jq -r '.sourceApiVersion // .packageDirectories[0].versionName // empty' sfdx-project.json || echo "")
-            API_VER=${API_VER:-60.0}
+            mkdir -p "changed-sources/package"
+            # tolerate missing/invalid sfdx-project.json without aborting the job
+            API_VER="$(jq -r '.sourceApiVersion // .packageDirectories[0].versionNumber // empty' sfdx-project.json 2>/dev/null || true)"
+            API_VER="${API_VER:-60.0}"
             printf '%s\n' \
               '<?xml version="1.0" encoding="UTF-8"?>' \
               '<Package xmlns="http://soap.sforce.com/2006/04/metadata">' \
               "  <version>${API_VER}</version>" \
-              '</Package>' > changed-sources/package/package.xml
-
+              '</Package>' > "changed-sources/package/package.xml"
           fi
 
           # Build flags: validate full set (adds/mods + optional destructive)
-          flags=( 
-            --target-org ProdForValidation 
-            --test-level RunLocalTests 
-            --wait 120 
-            --json 
-            --manifest "changed-sources/package/package.xml" 
+          flags=(
+            --target-org ProdForValidation
+            --test-level RunLocalTests
+            --wait 120
+            --json
+            --manifest "changed-sources/package/package.xml"
           )
 
           # If sfdx-git-delta produced destructive manifests, include them in the same validation
@@ -189,18 +190,19 @@ jobs:
             flags+=( --post-destructive-changes "changed-sources/destructiveChangesPost/destructiveChanges.xml" )
           fi
 
-          # Run the Quick-Deployable validation
-          sf project deploy validate "${flags[@]}" > prod-validate.json
+          # Run the Quick-Deployable validation (JSON to file)
+          sf project deploy validate "${flags[@]}" > "prod-validate.json"
 
-          # Capture useful outputs for later steps
-          VALIDATE_ID=$(jq -r '.id // .result.id // empty' prod-validate.json)
+          # Capture useful outputs for later steps (jq must not abort the job)
+          VALIDATE_ID="$(jq -r '.id // .result.id // empty' "prod-validate.json" 2>/dev/null || true)"
           echo "validate_id=${VALIDATE_ID}" >> "$GITHUB_OUTPUT"
-          echo "${VALIDATE_ID:-}" > prod-validate-id.txt || true
+          printf '%s' "${VALIDATE_ID:-}" > "prod-validate-id.txt" || true
 
-          status=$(jq -r '.status // .result.status // "unknown"' prod-validate.json || echo "unknown")
-          failures=$(jq '.result.details.runTestResult.failures | length // 0' prod-validate.json || echo 0)
-          echo "status=$status" >> "$GITHUB_OUTPUT"
-          echo "failures=$failures" >> "$GITHUB_OUTPUT"
+          status="$(jq -r '.status // .result.status // "unknown"' "prod-validate.json" 2>/dev/null || echo "unknown")"
+          failures="$(jq '.result.details.runTestResult.failures | length // 0' "prod-validate.json" 2>/dev/null || echo 0)"
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          echo "failures=${failures}" >> "$GITHUB_OUTPUT"
+
       - name: Upload prod validation JSON artifacts
         if: steps.outputs.skip_process != 'true'
         uses: actions/upload-artifact@v4
