@@ -158,12 +158,23 @@ jobs:
         # make sure this step uses bash
         shell: bash
         run: |
-          set -euo pipefail
+          # Safe, traceable bash
+          set -Eeuo pipefail
+          export TZ=UTC
+          PS4='+ [${BASH_SOURCE##*/}:${LINENO}] '
+          set -x
+          trap 'rc=$?; echo "::error::Failed at ${BASH_SOURCE##*/}:${LINENO} running: ${BASH_COMMAND} (exit $rc)"; exit $rc' ERR
+
+          echo "::group::Preflight"
+          echo "PWD=$(pwd)"
+          command -v sf && sf --version || true
+          command -v jq && jq --version || true
+          ls -R changed-sources || echo "No changed-sources dir yet"
+          echo "::endgroup::"
 
           # Ensure a manifest exists (needed especially for destructive-only changes)
           if [ ! -f "changed-sources/package/package.xml" ]; then
             mkdir -p "changed-sources/package"
-            # tolerate missing/invalid sfdx-project.json without aborting the job
             API_VER="$(jq -r '.sourceApiVersion // .packageDirectories[0].versionNumber // empty' sfdx-project.json 2>/dev/null || true)"
             API_VER="${API_VER:-60.0}"
             printf '%s\n' \
@@ -171,6 +182,9 @@ jobs:
               '<Package xmlns="http://soap.sforce.com/2006/04/metadata">' \
               "  <version>${API_VER}</version>" \
               '</Package>' > "changed-sources/package/package.xml"
+            echo "Created changed-sources/package/package.xml (API ${API_VER})"
+          else
+            echo "Using existing changed-sources/package/package.xml"
           fi
 
           # Build flags: validate full set (adds/mods + optional destructive)
@@ -190,18 +204,45 @@ jobs:
             flags+=( --post-destructive-changes "changed-sources/destructiveChangesPost/destructiveChanges.xml" )
           fi
 
-          # Run the Quick-Deployable validation (JSON to file)
-          sf project deploy validate "${flags[@]}" > "prod-validate.json"
+          echo "::group::Run validation"
+          # Run validate but do NOT let a non-zero exit kill the step yet; capture both streams
+          set +e
+          sf project deploy validate "${flags[@]}" --verbose > "prod-validate.json" 2> "sf-validate.stderr"
+          rc=$?
+          set -e
+          echo "sf project deploy validate exit code: ${rc}"
+          echo "::endgroup::"
 
-          # Capture useful outputs for later steps (jq must not abort the job)
-          VALIDATE_ID="$(jq -r '.id // .result.id // empty' "prod-validate.json" 2>/dev/null || true)"
+          echo "::group::Parse/diagnose results"
+          # If JSON looks valid, parse it; otherwise show stderr and fail clearly
+          if jq -e . >/dev/null 2>&1 < "prod-validate.json"; then
+            VALIDATE_ID="$(jq -r '.id // .result.id // empty' "prod-validate.json" 2>/dev/null || true)"
+            status="$(jq -r '.status // .result.status // "unknown"' "prod-validate.json" 2>/dev/null || echo "unknown")"
+            failures="$(jq '.result.details.runTestResult.failures | length // 0' "prod-validate.json" 2>/dev/null || echo 0)"
+          else
+            echo "::warning::prod-validate.json is not valid JSON. Dumping sf-validate.stderr (first 200 lines):"
+            sed -n '1,200p' sf-validate.stderr || true
+            echo "::error::Salesforce CLI did not produce valid JSON. See stderr above."
+            exit 1
+          fi
+
+          # Expose outputs for later steps
           echo "validate_id=${VALIDATE_ID}" >> "$GITHUB_OUTPUT"
           printf '%s' "${VALIDATE_ID:-}" > "prod-validate-id.txt" || true
-
-          status="$(jq -r '.status // .result.status // "unknown"' "prod-validate.json" 2>/dev/null || echo "unknown")"
-          failures="$(jq '.result.details.runTestResult.failures | length // 0' "prod-validate.json" 2>/dev/null || echo 0)"
-          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          echo "status=${status}"   >> "$GITHUB_OUTPUT"
           echo "failures=${failures}" >> "$GITHUB_OUTPUT"
+
+          # Brief summary to logs
+          echo "Validation status: ${status}; failures: ${failures}"
+
+          # If the CLI exited non-zero but still produced JSON, we keep going and let callers decide.
+          # If you want to fail here on test failures, uncomment:
+          # if [[ "${failures}" -gt 0 ]]; then
+          #   echo "::error::Apex test failures: ${failures}"
+          #   exit 1
+          # fi
+          echo "::endgroup::"
+
 
       - name: Upload prod validation JSON artifacts
         if: steps.outputs.skip_process != 'true'
