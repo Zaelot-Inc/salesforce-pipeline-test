@@ -79,7 +79,6 @@ jobs:
           echo "HEAD of PR: ${{ github.event.pull_request.head.sha }}"
 
       - name: Generate delta (origin/main -> PR head)
-        if: steps.touched.outputs.has_force_app == 'true'
         id: delta
         run: |
           set -euo pipefail
@@ -88,19 +87,29 @@ jobs:
           mkdir -p changed-sources
           sf sgd source delta \
             --from "origin/main" \
-            --to "${TO_SHA}" \
+            --to   "${TO_SHA}" \
             --output "changed-sources" \
             --generate-delta \
             --source "force-app/"
 
+          has_addmods="false"
+          has_deletions="false"
+
           if [ -d changed-sources/force-app ] && [ -n "$(ls -A changed-sources/force-app || true)" ]; then
-            echo "no_changes=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "no_changes=true" >> "$GITHUB_OUTPUT"
+            has_addmods="true"
+          fi
+          if [ -f "changed-sources/destructiveChanges/destructiveChanges.xml" ] || \
+            [ -f "changed-sources/destructiveChangesPost/destructiveChanges.xml" ]; then
+            has_deletions="true"
           fi
 
+          echo "has_addmods=$has_addmods"     >> "$GITHUB_OUTPUT"
+          echo "has_deletions=$has_deletions" >> "$GITHUB_OUTPUT"
+
+
       - name: Early exit if no metadata changes
-        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes == 'true'
+        id: early
+        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.has_addmods != 'true' && steps.delta.outputs.has_deletions != 'true'
         uses: actions/github-script@v7
         with:
           script: |
@@ -108,9 +117,10 @@ jobs:
             const number = context.payload.pull_request.number;
             const body = "ℹ️ No deployable metadata differences detected between `main` and this PR — skipping Production validation.";
             await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
+            core.setOutput('skip_process', 'true');
 
       - name: Write Prod JWT key
-        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
+        if: steps.outputs.skip_process != 'true'
         env:
           SF_JWT_KEY_PROD: ${{ secrets.SF_JWT_KEY }}
         run: |
@@ -120,7 +130,7 @@ jobs:
           printf "%s" "$SF_JWT_KEY_PROD" > jwt_prod.key
 
       - name: Login to Production (JWT)
-        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
+        if: steps.outputs.skip_process != 'true'
         env:
           SF_JWT_CLIENT_PROD: ${{ secrets.SF_JWT_CLIENT }}
           SF_JWT_USERNAME_PROD: ${{ secrets.SF_JWT_USERNAME }}
@@ -133,76 +143,115 @@ jobs:
             --instance-url "${SF_LOGIN_URL_PROD}" \
             --alias ProdForValidation --set-default --json
 
-      - name: Validate-only deploy to Production (check-only) and persist JSON
-        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
+      - name: Validate deployment to Production (Quick Deploy–ready) and persist JSON + ID
+        id: prod_validate
+        if: steps.outputs.skip_process != 'true'
         run: |
           set -euo pipefail
-          PROD_VALIDATION_FILE=prod-validate.json
-          sf project deploy start \
-            --source-dir "changed-sources/force-app" \
-            --target-org ProdForValidation \
-            --dry-run \
-            --test-level RunLocalTests \
-            --wait 120 \
-            --json > "${PROD_VALIDATION_FILE}"
 
-          if [ -s "${PROD_VALIDATION_FILE}" ] && jq -e . >/dev/null 2>&1 < "${PROD_VALIDATION_FILE}"; then
-            status=$(jq -r '.status // .result.status // "unknown"' "${PROD_VALIDATION_FILE}" || echo "unknown")
-            failures=$(jq '.result.details.runTestResult.failures | length // 0' "${PROD_VALIDATION_FILE}" || echo 0)
-            echo "Validation status: ${status}; failures: ${failures}"
-          else
-            echo "prod-validate.json missing/invalid"; exit 1
+          # Ensure a manifest exists (needed especially for destructive-only changes)
+          if [ ! -f "changed-sources/package/package.xml" ]; then
+            mkdir -p changed-sources/package
+            API_VER=$(jq -r '.sourceApiVersion // .packageDirectories[0].versionName // empty' sfdx-project.json || echo "")
+            API_VER=${API_VER:-60.0}
+            cat > changed-sources/package/package.xml <<EOF
+            <?xml version="1.0" encoding="UTF-8"?>
+            <Package xmlns="http://soap.sforce.com/2006/04/metadata">
+              <version>${API_VER}</version>
+            </Package>
+            EOF
           fi
 
-      - name: Upload prod validation JSON artifact
-        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
+          # Build flags: validate full set (adds/mods + optional destructive)
+          flags=( 
+            --target-org ProdForValidation 
+            --test-level RunLocalTests 
+            --wait 120 
+            --json 
+            --manifest "changed-sources/package/package.xml" 
+          )
+
+          # If sfdx-git-delta produced destructive manifests, include them in the same validation
+          if [ -f "changed-sources/destructiveChanges/destructiveChanges.xml" ]; then
+            flags+=( --pre-destructive-changes "changed-sources/destructiveChanges/destructiveChanges.xml" )
+          fi
+          if [ -f "changed-sources/destructiveChangesPost/destructiveChanges.xml" ]; then
+            flags+=( --post-destructive-changes "changed-sources/destructiveChangesPost/destructiveChanges.xml" )
+          fi
+
+          # Run the Quick-Deployable validation
+          sf project deploy validate "${flags[@]}" > prod-validate.json
+
+          # Capture useful outputs for later steps
+          VALIDATE_ID=$(jq -r '.id // .result.id // empty' prod-validate.json)
+          echo "validate_id=${VALIDATE_ID}" >> "$GITHUB_OUTPUT"
+          echo "${VALIDATE_ID:-}" > prod-validate-id.txt || true
+
+          status=$(jq -r '.status // .result.status // "unknown"' prod-validate.json || echo "unknown")
+          failures=$(jq '.result.details.runTestResult.failures | length // 0' prod-validate.json || echo 0)
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "failures=$failures" >> "$GITHUB_OUTPUT"
+      - name: Upload prod validation JSON artifacts
+        if: steps.outputs.skip_process != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: prod-validate-json-pr-${{ github.event.pull_request.number }}
-          path: prod-validate.json
+          name: prod-validate-pr-${{ github.event.pull_request.number }}
+          path: |
+            prod-validate.json
+            prod-validate-id.txt
+
 
       - name: Comment results on the PR and fail on test errors
-        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
+        if: steps.outputs.skip_process != 'true'
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
             const owner = context.repo.owner, repo = context.repo.repo;
             const number = context.payload.pull_request.number;
-            const file = 'prod-validate.json';
 
-            let body = "### Production validation result\n\n";
+            const file = 'prod-validate.json';
+            const idPath = 'prod-validate-id.txt';
+            let body = "### Production validation result (Quick Deploy–ready)\n\n";
+
+            let validateId = '';
+            if (fs.existsSync(idPath)) {
+              validateId = fs.readFileSync(idPath, 'utf8').trim();
+            }
+
+            let failures = [];
+            let deployStatus = 'unknown';
             if (fs.existsSync(file)) {
               try {
                 const data = JSON.parse(fs.readFileSync(file,'utf8'));
-                const failures = (((data || {}).result || {}).details || {}).runTestResult?.failures || [];
-                const deployStatus = data?.status || (data?.result?.status) || 'unknown';
-                body += `Status: **${deployStatus}**\n\n`;
-                if (failures.length) {
-                  body += `Found **${failures.length}** failing Apex test(s):\n\n| Class | Method | Message |\n|---|---|---|\n`;
-                  for (const f of failures.slice(0,30)) {
-                    const msg = String(f.message || '').replace(/\n/g, ' ').slice(0,500);
-                    body += `| ${f.name} | ${f.methodName} | ${msg} |\n`;
-                  }
-                  body += `\n(Full validation JSON uploaded as artifact)\n`;
-                } else {
-                  body += "No Apex test failures found.\n";
-                }
-                await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
-                if (failures.length) {
-                  core.setFailed(`Prod validation reported ${failures.length} Apex failures.`);
-                }
+                failures = (((data || {}).result || {}).details || {}).runTestResult?.failures || [];
+                deployStatus = data?.status || (data?.result?.status) || 'unknown';
               } catch (e) {
-                await github.rest.issues.createComment({
-                  owner, repo, issue_number: number,
-                  body: `Could not parse prod-validate.json: ${e.message}`
-                });
-                core.setFailed('Invalid validation JSON.');
+                body += `Could not parse prod-validate.json: ${e.message}\n\n`;
               }
             } else {
-              await github.rest.issues.createComment({
-                owner, repo, issue_number: number,
-                body: "No prod-validate.json produced; check workflow logs."
-              });
-              core.setFailed('No validation JSON produced.');
+              body += "No prod-validate.json produced; check workflow logs.\n\n";
             }
+
+            body += `Status: **${deployStatus}**\n\n`;
+            if (validateId) {
+              body += `**Validation ID:** \`${validateId}\`\n\n`;
+              body += `You can Quick Deploy later with:\n\n`;
+              body += "```bash\n";
+              body += `sf project deploy quick --target-org ProdForValidation --job-id ${validateId} --wait 120 --json\n`;
+              body += "```\n\n";
+            }
+
+            if (failures.length) {
+              body += `Found **${failures.length}** failing Apex test(s):\n\n| Class | Method | Message |\n|---|---|---|\n`;
+              for (const f of failures.slice(0,30)) {
+                const msg = String(f.message || '').replace(/\n/g, ' ').slice(0,500);
+                body += `| ${f.name} | ${f.methodName} | ${msg} |\n`;
+              }
+              body += `\n(Full validation JSON uploaded as artifact.)\n`;
+            } else {
+              body += "No Apex test failures found.\n";
+            }
+
+            await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
+            if (failures.length) core.setFailed(`Prod validation reported ${failures.length} Apex failures.`);

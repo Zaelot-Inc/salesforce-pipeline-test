@@ -165,27 +165,137 @@ jobs:
       # Step 9: Apply the delta to the new release branch.
       # The rsync command overlays the delta (force-app, destructiveChanges, etc.) onto the 'main' checkout.
       # It does NOT delete files from 'main', it only adds/updates them with the delta content.
-      - name: Copy delta into release branch and commit
+      # Step 9 (REPLACE): apply changed files from feature; handle deletions; no packaging files
+      - name: Apply feature changes to release branch + generate manifests (adds/mods/deletes only)
         if: steps.gen_delta.outputs.no_changes == 'false'
         run: |
           set -euo pipefail
-          # Use the official GitHub Actions bot as the committer for clarity.
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "github-actions[bot]"
-          
-          echo "Copying all delta files..."
-          rsync -av changed-sources/ ./
 
-          # Add all new/modified files from the delta to the git stage.
-          git add -A .
-          
+          # Identify ourselves for the commit
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global user.name  "github-actions[bot]"
+
+          # Feature ref (from Step 5), fallback to head SHA (from Step 2)
+          TO_REF="${FETCH_REF:-${PR_HEAD_SHA}}"
+
+          # -------- A) Bring in adds/edits; remove deletions --------
+          # NOTE: If you kept '--find-renames' elsewhere, either remove it (treat as add+delete)
+          # or extend filters to include 'R'. This variant treats renames as add+delete.
+          while IFS= read -r path; do
+            [ -n "$path" ] || continue
+            git checkout "$TO_REF" -- "$path"
+          done < <(git diff --name-only --diff-filter=AM origin/main "$TO_REF" -- "force-app/**")
+
+          while IFS= read -r path; do
+            [ -n "$path" ] || continue
+            git rm -f -- "$path" || true
+          done < <(git diff --name-only --diff-filter=D origin/main "$TO_REF" -- "force-app/**")
+
+          # -------- B) Create branch-scoped manifest(s) --------
+          # Build safe file name from the original branch (Step 2: PR_HEAD_REF)
+          BRANCH_RAW="${PR_HEAD_REF}"
+          # Replace anything non [A-Za-z0-9._-] with '-'
+          BRANCH_SAFE="$(printf "%s" "$BRANCH_RAW" | sed -E 's/[^A-Za-z0-9._-]+/-/g')"
+
+          mkdir -p manifest/branches
+
+          # 1) Regular package manifest: manifest/branches/{branch}Package.xml
+          PKG_PATH="manifest/branches/${BRANCH_SAFE}Package.xml"
+          if [ -f "changed-sources/package/package.xml" ]; then
+            # Use the package generated in Step 6’s delta for exact adds/edits
+            cp "changed-sources/package/package.xml" "$PKG_PATH"
+          else
+            # Delta can be deletion-only; synthesize a minimal, valid package.xml for audit
+            API_VER="$(jq -r '.sourceApiVersion // empty' sfdx-project.json 2>/dev/null || true)"
+            API_VER="${API_VER:-60.0}"
+            cat > "$PKG_PATH" <<EOF
+            <?xml version="1.0" encoding="UTF-8"?>
+            <Package xmlns="http://soap.sforce.com/2006/04/metadata">
+              <version>${API_VER}</version>
+            </Package>
+            EOF
+          fi
+
+          # 2) Destructive manifest (merged pre+post if present): {branch}Package-destructive.xml
+          PRE_XML="changed-sources/destructiveChanges/destructiveChanges.xml"
+          POST_XML="changed-sources/destructiveChangesPost/destructiveChanges.xml"
+          if [ -f "$PRE_XML" ] || [ -f "$POST_XML" ]; then
+            DEST_PATH="manifest/branches/${BRANCH_SAFE}Package-destructive.xml"
+            export DEST_PATH
+            # Merge both destructive manifests into a single audit file
+            python3 - <<'PY'
+            import os, json
+            from xml.etree import ElementTree as ET
+
+            def read_api_ver():
+                try:
+                    with open("sfdx-project.json","r") as f:
+                        data = json.load(f)
+                        v = data.get("sourceApiVersion")
+                        return str(v) if v else "60.0"
+                except Exception:
+                    return "60.0"
+
+            NS = {"m":"http://soap.sforce.com/2006/04/metadata"}
+            def collect(path):
+                items = {}
+                if not os.path.isfile(path): return items
+                try:
+                    root = ET.parse(path).getroot()
+                    for t in root.findall("m:types", NS):
+                        name = (t.find("m:name", NS).text or "").strip()
+                        if not name: continue
+                        items.setdefault(name, set())
+                        for mem in t.findall("m:members", NS):
+                            m = (mem.text or "").strip()
+                            if m: items[name].add(m)
+                except Exception:
+                    pass
+                return items
+
+            merged = {}
+            for p in [ "changed-sources/destructiveChanges/destructiveChanges.xml",
+                      "changed-sources/destructiveChangesPost/destructiveChanges.xml" ]:
+                sub = collect(p)
+                for k,v in sub.items():
+                    merged.setdefault(k, set()).update(v)
+
+            api_ver = read_api_ver()
+            pkg = ET.Element("Package", xmlns=NS["m"])
+            for tname in sorted(merged.keys()):
+                t = ET.SubElement(pkg, "types")
+                for m in sorted(merged[tname]):
+                    ET.SubElement(t, "members").text = m
+                ET.SubElement(t, "name").text = tname
+            ET.SubElement(pkg, "version").text = api_ver
+
+            xml = ET.tostring(pkg, encoding="utf-8")
+            # Pretty-print if available
+            try:
+                from xml.dom import minidom
+                xml = minidom.parseString(xml).toprettyxml(indent="  ", encoding="utf-8")
+            except Exception:
+                pass
+
+            dest = os.environ.get("DEST_PATH","manifest/branches/branchPackage-destructive.xml")
+            with open(dest, "wb") as f:
+                f.write(xml if isinstance(xml, bytes) else xml.encode("utf-8"))
+            PY
+          fi
+
+          # -------- C) Stage only metadata + the new manifests (avoid changed-sources/) --------
+          git add -A -- "force-app" "manifest/branches"
+
+          # -------- D) Commit only if there are changes --------
           if git diff --cached --quiet; then
             echo "Release creation aborted: no changes to commit."
             exit 0
           fi
-          
+
           git commit -m "release: promote PR #${PR_NUMBER} (${PR_HEAD_REF} -> main) [automated]"
           git push origin "HEAD:${RELEASE_BRANCH}"
+
+
 
       # Step 10: Open the pull request from the new release branch to main.
       # This script polls the API to ensure the branch exists before attempting to create the PR, avoiding race conditions.

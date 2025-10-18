@@ -12,6 +12,9 @@ jobs:
       actions: read # Grants permission to read the in-progress actions. Only necessary for private repos.
     runs-on: ubuntu-latest
     steps:
+      - name: Check PR is Draft
+        if: github.event.pull_request.draft == false
+        run: exit 1
       - name: Check out files
         uses: actions/checkout@v4
         with:
