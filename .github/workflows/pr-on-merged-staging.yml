@@ -102,7 +102,6 @@ jobs:
             echo "FETCH_REF=${PR_HEAD_SHA}" >> $GITHUB_ENV
           fi
 
-      # ⬇️ Only this step is modified to also expose the integration merge ref while keeping release delta
       - name: Generate metadata delta (origin/main -> feature) and set integration ref
         id: gen_delta
         env:
@@ -192,9 +191,7 @@ jobs:
           fi
           git commit -m "release: promote PR #${PR_NUMBER} (${PR_HEAD_REF} -> main) [automated]"
           git push origin "HEAD:${RELEASE_BRANCH}"
-          
-          echo "Waiting 5s for ref propagation..."
-          sleep 5
+          # Removed 'sleep 5' as the next step now polls
 
       - name: Open PR from release branch into main
         id: open_pr
@@ -203,6 +200,23 @@ jobs:
           REL_BRANCH: ${{ env.RELEASE_BRANCH }}
         with:
           script: |
+            // Helper function to poll for the branch
+            const poll = async (fn, { interval, timeout }) => {
+              const start = Date.now();
+              while (true) {
+                try {
+                  return await fn(); // Attempt to resolve the function
+                } catch (e) {
+                  if (Date.now() - start > timeout) {
+                    core.error(`Polling timed out after ${timeout}ms. Last error: ${e.message}`);
+                    throw e; // Rerethrow the last error
+                  }
+                  core.info(`Check for branch failed, retrying in ${interval}ms...`);
+                  await new Promise(resolve => setTimeout(resolve, interval));
+                }
+              }
+            };
+
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
 
@@ -214,11 +228,15 @@ jobs:
               return;
             }
 
-            // Verify the branch exists on the remote
+            // Verify the branch exists on the remote using polling
             try {
-              await github.rest.git.getRef({ owner, repo, ref: `heads/${branch}` });
+              await poll(
+                () => github.rest.git.getRef({ owner, repo, ref: `heads/${branch}` }),
+                { interval: 5000, timeout: 30000 } // Poll every 5s for 30s
+              );
+              core.info(`Found remote branch 'heads/${branch}' after polling.`);
             } catch (e) {
-              core.setFailed(`Remote branch 'heads/${branch}' not found. Did 'git push origin HEAD:${branch}' succeed? ${e.message}`);
+              core.setFailed(`Remote branch 'heads/${branch}' not found even after polling. Did 'git push' succeed? ${e.message}`);
               return;
             }
 
@@ -235,14 +253,14 @@ jobs:
               return;
             }
 
-            // Create the PR (use owner:branch for 'head' to avoid ambiguity)
+            // Create the PR
             const title = `[release] Promote PR #${process.env.PR_NUMBER} -> main: ${process.env.PR_TITLE}`;
             const body  = `Automated release PR to promote feature from staging PR #${process.env.PR_NUMBER}.`;
 
             try {
               const { data: pr } = await github.rest.pulls.create({
                 owner, repo,
-                head: branch,   // <-- MODIFIED: Simpler head parameter
+                head: branch,
                 base,
                 title, body,
                 maintainer_can_modify: true
