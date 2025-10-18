@@ -118,7 +118,13 @@ jobs:
             const body = "ℹ️ No deployable metadata differences detected between `main` and this PR — skipping Production validation.";
             await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
             core.setOutput('skip_process', 'true');
-
+      - name: Sanity check JWT env
+        run: |
+          echo "Endpoint: ${SF_LOGIN_URL_PROD}"
+          echo "Client ID length: ${#SF_JWT_CLIENT_PROD}"
+          echo "Username: ${SF_JWT_USERNAME_PROD}"
+          openssl rsa -in jwt_prod.key -check -noout >/dev/null && echo "Private key OK" || (echo "Bad private key"; exit 1)
+          
       - name: Write Prod JWT key
         if: steps.outputs.skip_process != 'true'
         env:
