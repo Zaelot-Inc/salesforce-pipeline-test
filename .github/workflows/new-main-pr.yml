@@ -164,10 +164,10 @@ jobs:
             API_VER=$(jq -r '.sourceApiVersion // .packageDirectories[0].versionName // empty' sfdx-project.json || echo "")
             API_VER=${API_VER:-60.0}
             cat > changed-sources/package/package.xml <<EOF
-            <?xml version="1.0" encoding="UTF-8"?>
-            <Package xmlns="http://soap.sforce.com/2006/04/metadata">
-              <version>${API_VER}</version>
-            </Package>
+              <?xml version="1.0" encoding="UTF-8"?>
+              <Package xmlns="http://soap.sforce.com/2006/04/metadata">
+                <version>${API_VER}</version>
+              </Package>
             EOF
           fi
 
