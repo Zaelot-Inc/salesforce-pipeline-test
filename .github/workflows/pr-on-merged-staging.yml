@@ -102,6 +102,7 @@ jobs:
             echo "FETCH_REF=${PR_HEAD_SHA}" >> $GITHUB_ENV
           fi
 
+      # ⬇️ MODIFIED to check for destructive changes as well
       - name: Generate metadata delta (origin/main -> feature) and set integration ref
         id: gen_delta
         env:
@@ -127,8 +128,12 @@ jobs:
             --generate-delta \
             --source "force-app/"
 
-          if [ -d changed-sources/force-app ] && [ -n "$(ls -A changed-sources/force-app || true)" ]; then
-            find changed-sources/force-app -type f | sed 's#^changed-sources/##' > changed-files.txt
+          # MODIFIED: Check for force-app OR destructive changes
+          if [ -n "$(ls -A changed-sources/force-app/ || true)" ] || \
+             [ -f "changed-sources/destructiveChanges/destructiveChanges.xml" ] || \
+             [ -f "changed-sources/destructiveChangesPost/destructiveChanges.xml" ]; then
+            
+            find changed-sources -type f | sed 's#^changed-sources/##' > changed-files.txt
             echo "no_changes=false" >> "$GITHUB_OUTPUT"
             echo "changed_files_list=changed-files.txt" >> "$GITHUB_OUTPUT"
           else
@@ -154,6 +159,7 @@ jobs:
           FEATURE_REF="${FETCH_REF}"
           MERGE_BASE=$(git merge-base origin/main "${FEATURE_REF}")
           git diff --name-only "${MERGE_BASE}" origin/main > files_changed_on_main_since_base.txt
+          # MODIFIED: Check against changed-files.txt (which now includes non-force-app files)
           if [ -s changed-files.txt ] && [ -s files_changed_on_main_since_base.txt ] && \
              grep -xF -f changed-files.txt files_changed_on_main_since_base.txt >/dev/null 2>&1; then
             BODY="⛔ *Promotion blocked*: Files changed on \`main\` since this branch diverged also appear in the feature delta. Please rebase/merge main into the feature and retry."
@@ -172,6 +178,7 @@ jobs:
           echo "RELEASE_BRANCH=${RELEASE_BRANCH}" >> $GITHUB_ENV
           echo "release_branch=${RELEASE_BRANCH}" >> $GITHUB_OUTPUT
 
+      # ⬇️ MODIFIED to copy entire delta and add all files
       - name: Copy delta into release branch and commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -179,19 +186,24 @@ jobs:
           set -euo pipefail
           git config --global user.email "augusto@zaelot.com"
           git config --global user.name "Augusto Presotto"
-          if [ -d "changed-sources/force-app" ] && [ -n "$(ls -A changed-sources/force-app || true)" ]; then
-            rsync -av --delete changed-sources/force-app/ force-app/
-            git add -A force-app/
-          else
-            echo "No changed-sources/force-app — skipping rsync."
-          fi
+          
+          echo "Copying all delta files..."
+          # Copy EVERYTHING from changed-sources (force-app, destructiveChanges, etc.)
+          # Use 'dot-glob' to ensure hidden files (if any) are copied
+          shopt -s dotglob
+          rsync -av --delete changed-sources/ ./
+          shopt -u dotglob
+
+          # Add ALL changes (force-app, destructiveChanges, etc.)
+          git add -A .
+          
           if git diff --cached --quiet; then
             gh pr comment "${PR_NUMBER}" --body "Release creation aborted: no changes to commit on release branch for PR #${PR_NUMBER}." || true
             exit 0
           fi
+          
           git commit -m "release: promote PR #${PR_NUMBER} (${PR_HEAD_REF} -> main) [automated]"
           git push origin "HEAD:${RELEASE_BRANCH}"
-          # Removed 'sleep 5' as the next step now polls
 
       - name: Open PR from release branch into main
         id: open_pr
@@ -268,7 +280,7 @@ jobs:
               core.setOutput("release_pr_number", pr.number.toString());
               core.setOutput("release_pr_url", pr.html_url);
               core.info(`Created release PR #${pr.number}`);
-            } catch (e) {
+            } catch (e)
               core.setFailed(
                 `Failed to create release PR: ${e.message}\n` +
                 `Diagnostics:\n- repo: ${owner}/${repo}\n- head: ${branch}\n- base: ${base}`
