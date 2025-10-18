@@ -154,6 +154,7 @@ jobs:
 
       - name: Validate deployment to Production (Quick Deploy–ready) and persist JSON + ID
         id: prod_validate
+        shell: bash
         if: steps.outputs.skip_process != 'true'
         run: |
           set -euo pipefail
@@ -163,12 +164,12 @@ jobs:
             mkdir -p changed-sources/package
             API_VER=$(jq -r '.sourceApiVersion // .packageDirectories[0].versionName // empty' sfdx-project.json || echo "")
             API_VER=${API_VER:-60.0}
-            cat > changed-sources/package/package.xml <<EOF
-              <?xml version="1.0" encoding="UTF-8"?>
-              <Package xmlns="http://soap.sforce.com/2006/04/metadata">
-                <version>${API_VER}</version>
-              </Package>
-            EOF
+            printf '%s\n' \
+              '<?xml version="1.0" encoding="UTF-8"?>' \
+              '<Package xmlns="http://soap.sforce.com/2006/04/metadata">' \
+              "  <version>${API_VER}</version>" \
+              '</Package>' > changed-sources/package/package.xml
+
           fi
 
           # Build flags: validate full set (adds/mods + optional destructive)
