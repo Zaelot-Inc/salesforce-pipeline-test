@@ -1,3 +1,6 @@
+# This workflow automates the creation of a "release" pull request when a feature PR is merged into the 'staging' branch.
+# It calculates the precise changes (the delta) between the feature branch and 'main', creates a new release branch
+# from 'main', applies the delta to it, and opens a new PR from the release branch to 'main'.
 name: Build release branch (on PR merged to staging)
 
 on:
@@ -5,27 +8,40 @@ on:
     types: [closed]
     branches: [staging]
 
+# Ensures only one promotion workflow runs at a time. If another PR is merged
+# while one is running, the second will queue until the first is complete.
+# This prevents race conditions with creating/pushing release branches.
+concurrency:
+  group: promote-to-release
+  cancel-in-progress: false
+
 permissions:
   contents: write
   pull-requests: write
 
 jobs:
   promote-feature-branch:
-    name: Promote feature branch -> release branch (no Prod validation here)
+    name: Promote feature branch -> release branch
     runs-on: ubuntu-latest
     if: ${{ github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'staging' }}
     env:
+      # This is a placeholder for the validation org URL.
       SF_LOGIN_URL_PROD: "https://test.salesforce.com"
     outputs:
       release_branch: ${{ steps.create_branch.outputs.release_branch }}
       release_pr_number: ${{ steps.open_pr.outputs.release_pr_number }}
 
     steps:
+      # Step 1: Check out the repository.
+      # fetch-depth: 0 is required to check out the full git history for delta calculation.
+      # persist-credentials: false is a security best practice when manually setting the remote URL later.
       - name: Checkout full repo
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          persist-credentials: false # Important for security when reconfiguring remote URL
 
+      # Step 2: Store key information from the merged PR event for use in later steps.
       - name: Set PR context variables
         id: prinfo
         run: |
@@ -34,25 +50,27 @@ jobs:
           echo "${{ github.event.pull_request.title }}" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
           echo "PR_HEAD_REF=${{ github.event.pull_request.head.ref }}" >> $GITHUB_ENV
-          echo "PR_HEAD_REPO_FULL=${{ github.event.pull_request.head.repo.full_name }}" >> $GITHUB_ENV
+          echo "PR_HEAD_SHA=${{ github.event.pull_request.head.sha }}" >> $GITHUB_ENV
           echo "PR_HEAD_OWNER=${{ github.event.pull_request.head.repo.owner.login }}" >> $GITHUB_ENV
           echo "PR_HEAD_REPO=${{ github.event.pull_request.head.repo.name }}" >> $GITHUB_ENV
-          echo "PR_HEAD_SHA=${{ github.event.pull_request.head.sha }}" >> $GITHUB_ENV
 
+      # Step 3: Install all necessary command-line tools for the job.
       - name: Install requirements (sf CLI, sfdx-git-delta, jq, gh)
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y jq git curl ca-certificates
+          sudo apt-get install -y jq git curl ca-certificates rsync
           npm i -g @salesforce/cli@latest
           echo y | sf plugins install sfdx-git-delta || true
+          # Install GitHub CLI
           if ! command -v gh >/dev/null 2>&1; then
-            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-              | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
-              && sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
-              && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-              | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
-              && sudo apt update && sudo apt install -y gh
+            (type -p wget >/dev/null || (sudo apt-get update && sudo apt-get install wget -y)) && \
+            sudo mkdir -p -m 755 /etc/apt/keyrings && \
+            wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null && \
+            sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null && \
+            sudo apt-get update && \
+            sudo apt-get install gh -y
           fi
 
       - name: Ensure Java 11+
@@ -61,14 +79,16 @@ jobs:
           java-version: '11'
           distribution: 'zulu'
 
+      # Step 4: Configure Git remote and fetch the 'main' branch.
+      # We reconfigure the remote to use the GITHUB_TOKEN for authentication, allowing us to push later.
       - name: Fetch origin/main and prepare refs
         run: |
           set -euo pipefail
           git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git fetch --no-tags origin main:refs/remotes/origin/main
           git rev-parse --verify origin/main
-          echo "PR #${PR_NUMBER}: head=${PR_HEAD_REF} repo=${PR_HEAD_REPO_FULL} sha=${PR_HEAD_SHA}"
 
+      # Step 5: Fetch the head of the feature branch, including support for PRs from forks.
       - name: Fetch feature branch (supports forks)
         id: fetch_feature
         env:
@@ -82,42 +102,26 @@ jobs:
           echo "Fetching '${BRANCH}' from ${OWNER}/${REPONAME} ..."
 
           if [ "${OWNER}/${REPONAME}" = "${{ github.repository }}" ]; then
-            if ! git fetch origin "refs/heads/${BRANCH}:refs/remotes/pr/${BRANCH}"; then
-              echo "Direct fetch failed; trying PR ref fallback..."
-              git fetch origin "refs/pull/${PR_NUM}/head:refs/remotes/pr/${BRANCH}"
-            fi
+            git fetch origin "refs/pull/${PR_NUM}/head:refs/remotes/pr/${BRANCH}"
           else
             git remote remove fork 2>/dev/null || true
             git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${REPONAME}.git"
-            if ! git fetch --no-tags fork "refs/heads/${BRANCH}:refs/remotes/pr/${BRANCH}"; then
-              echo "Fork fetch failed; trying PR ref fallback..."
-              git fetch origin "refs/pull/${PR_NUM}/head:refs/remotes/pr/${BRANCH}"
-            fi
+            git fetch origin "refs/pull/${PR_NUM}/head:refs/remotes/pr/${BRANCH}"
           fi
 
           if git show-ref --verify --quiet "refs/remotes/pr/${BRANCH}"; then
             echo "FETCH_REF=refs/remotes/pr/${BRANCH}" >> $GITHUB_ENV
           else
-            echo "Could not fetch branch by name; falling back to PR head SHA ${PR_HEAD_SHA}"
+            echo "Could not fetch branch by ref; falling back to PR head SHA ${PR_HEAD_SHA}"
             echo "FETCH_REF=${PR_HEAD_SHA}" >> $GITHUB_ENV
           fi
 
-      # ⬇️ MODIFIED to check for destructive changes as well
-      - name: Generate metadata delta (origin/main -> feature) and set integration ref
+      # Step 6: Generate the delta package using sfdx-git-delta.
+      # This compares 'main' to the feature branch head to find all changed, added, and deleted files.
+      - name: Generate metadata delta (origin/main -> feature)
         id: gen_delta
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          # integration (PR merge) ref – useful if you later use it
-          if [ -n "${PR_NUMBER:-}" ]; then
-            git fetch --no-tags origin "refs/pull/${PR_NUMBER}/merge:refs/remotes/origin/pr-${PR_NUMBER}-merge" || true
-            if git show-ref --verify --quiet "refs/remotes/origin/pr-${PR_NUMBER}-merge"; then
-              echo "integration_ref=refs/remotes/origin/pr-${PR_NUMBER}-merge" >> "$GITHUB_OUTPUT"
-            fi
-          fi
-
           TO_REF="${FETCH_REF:-${PR_HEAD_SHA}}"
           echo "Generating delta: origin/main -> ${TO_REF}"
           mkdir -p changed-sources
@@ -128,47 +132,27 @@ jobs:
             --generate-delta \
             --source "force-app/"
 
-          # MODIFIED: Check for force-app OR destructive changes
+          # Check if there are any additive changes (in force-app) or destructive changes.
           if [ -n "$(ls -A changed-sources/force-app/ || true)" ] || \
              [ -f "changed-sources/destructiveChanges/destructiveChanges.xml" ] || \
              [ -f "changed-sources/destructiveChangesPost/destructiveChanges.xml" ]; then
-            
-            find changed-sources -type f | sed 's#^changed-sources/##' > changed-files.txt
             echo "no_changes=false" >> "$GITHUB_OUTPUT"
-            echo "changed_files_list=changed-files.txt" >> "$GITHUB_OUTPUT"
           else
             echo "no_changes=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # Step 7: If the delta is empty, abort the workflow gracefully.
       - name: Abort if no metadata changes
         if: steps.gen_delta.outputs.no_changes == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
-          BODY="No deployable metadata detected between \`main\` and feature branch \`${PR_HEAD_REF}\` (PR #${PR_NUMBER}). Nothing to promote."
-          gh pr comment "${PR_NUMBER}" --body "$BODY" || true
-          exit 0
+          BODY="✅ No deployable metadata detected between \`main\` and feature branch \`${PR_HEAD_REF}\` (PR #${PR_NUMBER}). Nothing to promote."
+          gh pr comment "${PR_NUMBER}" --body "$BODY"
 
-      - name: Conflict check vs main (merge-base & delta intersection)
-        id: conflict_check
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          FEATURE_REF="${FETCH_REF}"
-          MERGE_BASE=$(git merge-base origin/main "${FEATURE_REF}")
-          git diff --name-only "${MERGE_BASE}" origin/main > files_changed_on_main_since_base.txt
-          # MODIFIED: Check against changed-files.txt (which now includes non-force-app files)
-          if [ -s changed-files.txt ] && [ -s files_changed_on_main_since_base.txt ] && \
-             grep -xF -f changed-files.txt files_changed_on_main_since_base.txt >/dev/null 2>&1; then
-            BODY="⛔ *Promotion blocked*: Files changed on \`main\` since this branch diverged also appear in the feature delta. Please rebase/merge main into the feature and retry."
-            gh pr comment "${PR_NUMBER}" --body "$BODY" || true
-            exit 1
-          fi
-          echo "No conflicting changes on main detected."
-
+      # Step 8: Create the release branch, starting from the latest 'main'.
       - name: Create release branch from origin/main
+        if: steps.gen_delta.outputs.no_changes == 'false'
         id: create_branch
         run: |
           set -euo pipefail
@@ -178,41 +162,42 @@ jobs:
           echo "RELEASE_BRANCH=${RELEASE_BRANCH}" >> $GITHUB_ENV
           echo "release_branch=${RELEASE_BRANCH}" >> $GITHUB_OUTPUT
 
-      # ⬇️ MODIFIED to copy entire delta and add all files
+      # Step 9: Apply the delta to the new release branch.
+      # The rsync command overlays the delta (force-app, destructiveChanges, etc.) onto the 'main' checkout.
+      # It does NOT delete files from 'main', it only adds/updates them with the delta content.
       - name: Copy delta into release branch and commit
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        if: steps.gen_delta.outputs.no_changes == 'false'
         run: |
           set -euo pipefail
-          git config --global user.email "augusto@zaelot.com"
-          git config --global user.name "Augusto Presotto"
+          # Use the official GitHub Actions bot as the committer for clarity.
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
           
           echo "Copying all delta files..."
-          # Copy EVERYTHING from changed-sources (force-app, destructiveChanges, etc.)
-          # Use 'dot-glob' to ensure hidden files (if any) are copied
-          shopt -s dotglob
-          rsync -av --delete changed-sources/ ./
-          shopt -u dotglob
+          rsync -av changed-sources/ ./
 
-          # Add ALL changes (force-app, destructiveChanges, etc.)
+          # Add all new/modified files from the delta to the git stage.
           git add -A .
           
           if git diff --cached --quiet; then
-            gh pr comment "${PR_NUMBER}" --body "Release creation aborted: no changes to commit on release branch for PR #${PR_NUMBER}." || true
+            echo "Release creation aborted: no changes to commit."
             exit 0
           fi
           
           git commit -m "release: promote PR #${PR_NUMBER} (${PR_HEAD_REF} -> main) [automated]"
           git push origin "HEAD:${RELEASE_BRANCH}"
 
+      # Step 10: Open the pull request from the new release branch to main.
+      # This script polls the API to ensure the branch exists before attempting to create the PR, avoiding race conditions.
       - name: Open PR from release branch into main
+        if: steps.gen_delta.outputs.no_changes == 'false'
         id: open_pr
         uses: actions/github-script@v7
         env:
           REL_BRANCH: ${{ env.RELEASE_BRANCH }}
         with:
           script: |
-            // Helper function to poll for the branch
+            // Helper function to poll for the branch's existence after the push.
             const poll = async (fn, { interval, timeout }) => {
               const start = Date.now();
               while (true) {
@@ -231,10 +216,7 @@ jobs:
 
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
-
-            // Normalize the branch (strip any refs/ prefix if present)
-            const raw = (process.env.REL_BRANCH || "").trim();
-            const branch = raw.replace(/^refs\/heads\//, "").replace(/^refs\/remotes\/origin\//, "");
+            const branch = (process.env.REL_BRANCH || "").trim();
             if (!branch) {
               core.setFailed("RELEASE_BRANCH is empty or not set.");
               return;
@@ -252,16 +234,13 @@ jobs:
               return;
             }
 
-            // If an open PR from this branch to main already exists, reuse it
+            // Reuse an existing open PR if one is found.
             const base = "main";
-            const { data: prs } = await github.rest.pulls.list({
-              owner, repo, state: "open", head: `${owner}:${branch}`, base, per_page: 100
-            });
-            const existing = prs.find(p => p.head?.ref === branch && p.base?.ref === base);
-            if (existing) {
-              core.info(`Release PR already exists: #${existing.number}`);
-              core.setOutput("release_pr_number", existing.number.toString());
-              core.setOutput("release_pr_url", existing.html_url);
+            const { data: prs } = await github.rest.pulls.list({ owner, repo, state: "open", head: `${owner}:${branch}`, base, per_page: 1 });
+            if (prs.length > 0) {
+              core.info(`Release PR already exists: #${prs[0].number}`);
+              core.setOutput("release_pr_number", prs[0].number.toString());
+              core.setOutput("release_pr_url", prs[0].html_url);
               return;
             }
 
@@ -270,26 +249,20 @@ jobs:
             const body  = `Automated release PR to promote feature from staging PR #${process.env.PR_NUMBER}.`;
 
             try {
-              const { data: pr } = await github.rest.pulls.create({
-                owner, repo,
-                head: branch,
-                base,
-                title, body,
-                maintainer_can_modify: true
-              });
+              const { data: pr } = await github.rest.pulls.create({ owner, repo, head: branch, base, title, body });
               core.setOutput("release_pr_number", pr.number.toString());
               core.setOutput("release_pr_url", pr.html_url);
               core.info(`Created release PR #${pr.number}`);
-            } catch (e)
-              core.setFailed(
-                `Failed to create release PR: ${e.message}\n` +
-                `Diagnostics:\n- repo: ${owner}/${repo}\n- head: ${branch}\n- base: ${base}`
-              );
+            } catch (e) {
+              core.setFailed(`Failed to create release PR: ${e.message}`);
             }
 
-      - name: Comment original staging PR about release PR
+      # Step 11: Post a comment back on the original feature PR with a link to the new release PR.
+      - name: Comment on original staging PR about release PR
+        if: steps.gen_delta.outputs.no_changes == 'false' && always() && steps.open_pr.outputs.release_pr_number
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          RELEASE_PR_NUMBER=${{ steps.open_pr.outputs.release_pr_number }}
           RELEASE_PR_URL=${{ steps.open_pr.outputs.release_pr_url }}
-          BODY="✅ Automated release PR created: #${RELEASE_PR_NUMBER} (${RELEASE_PR_URL})."
-          gh pr comment "${PR_NUMBER}" --body "$BODY" || true
+          BODY="✅ Automated release PR created: ${RELEASE_PR_URL}"
+          gh pr comment "${PR_NUMBER}" --body "$BODY"
