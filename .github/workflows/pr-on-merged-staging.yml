@@ -192,6 +192,9 @@ jobs:
           fi
           git commit -m "release: promote PR #${PR_NUMBER} (${PR_HEAD_REF} -> main) [automated]"
           git push origin "HEAD:${RELEASE_BRANCH}"
+          
+          echo "Waiting 5s for ref propagation..."
+          sleep 5
 
       - name: Open PR from release branch into main
         id: open_pr
@@ -239,7 +242,7 @@ jobs:
             try {
               const { data: pr } = await github.rest.pulls.create({
                 owner, repo,
-                head: `${owner}:${branch}`,   // <-- important
+                head: branch,   // <-- MODIFIED: Simpler head parameter
                 base,
                 title, body,
                 maintainer_can_modify: true
@@ -250,10 +253,9 @@ jobs:
             } catch (e) {
               core.setFailed(
                 `Failed to create release PR: ${e.message}\n` +
-                `Diagnostics:\n- repo: ${owner}/${repo}\n- head: ${owner}:${branch}\n- base: ${base}`
+                `Diagnostics:\n- repo: ${owner}/${repo}\n- head: ${branch}\n- base: ${base}`
               );
             }
-
 
       - name: Comment original staging PR about release PR
         run: |
