@@ -173,9 +173,17 @@ jobs:
       - name: Create manifest/branch/<branch>-package-destructive.xml (if deletions)
         if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.has_deletions == 'true'
         shell: bash
+        env:
+          # This correctly passes the variable TO the Python script
+          DEST_PATH: ${{ steps.naming.outputs.dest_path }}
         run: |
-            set -euo pipefail
-            python3 .github/scripts/merge_destructive.py
+          set -euo pipefail
+          
+          # This is a debug step, "checking the obvious"
+          echo "DEST_PATH is set to: ${DEST_PATH}"
+          
+          # Now, execute the Python script
+          python3 .github/scripts/merge_destructive.py
       - name: Can we push to this PR branch?
         id: canpush
         if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'

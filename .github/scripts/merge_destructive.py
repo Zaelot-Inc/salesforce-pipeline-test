@@ -1,6 +1,14 @@
 import os, json
 from xml.etree import ElementTree as ET
 
+# --- Get the environment variable (This is the "obvious check") ---
+dest = os.environ.get("DEST_PATH")
+if not dest:
+    print("Error: DEST_PATH environment variable not set or is empty.")
+    print("This must be set in the 'env:' block of the GitHub Actions workflow.")
+    exit(1)
+
+# --- The rest of your script ---
 NS = {"m":"http://soap.sforce.com/2006/04/metadata"}
 
 def read_api_ver():
@@ -28,7 +36,6 @@ def collect(path):
         print(f"Warning: Could not parse {path}: {e}")
     return items
 
-# --- Main script ---
 merged = {}
 for p in [
     "changed-sources/destructiveChanges/destructiveChanges.xml",
@@ -53,12 +60,6 @@ try:
     xml_string = minidom.parseString(xml_string).toprettyxml(indent="  ", encoding="utf-8")
 except Exception:
     pass # Use the non-prettified version if minidom fails
-
-# Get the destination path from the environment variable
-dest = os.environ.get("DEST_PATH")
-if not dest:
-    print("Error: DEST_PATH environment variable not set.")
-    exit(1)
 
 os.makedirs(os.path.dirname(dest), exist_ok=True)
 with open(dest, "wb") as f:
