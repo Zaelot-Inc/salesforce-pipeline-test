@@ -163,10 +163,10 @@ jobs:
             API_VER="$(jq -r '.sourceApiVersion // empty' sfdx-project.json 2>/dev/null || true)"
             API_VER="${API_VER:-64.0}"
             cat > "${{ steps.naming.outputs.pkg_path }}" <<-EOF
-              <?xml version="1.0" encoding="UTF-8"?>
-              <Package xmlns="http://soap.sforce.com/2006/04/metadata">
-                <version>${API_VER}</version>
-              </Package>
+            <?xml version="1.0" encoding="UTF-8"?>
+            <Package xmlns="http://soap.sforce.com/2006/04/metadata">
+              <version>${API_VER}</version>
+            </Package>
             EOF
           fi
 
