@@ -161,9 +161,8 @@ jobs:
           else
             # deletion-only changes -> synthesize a minimal, valid package.xml
             API_VER="$(jq -r '.sourceApiVersion // empty' sfdx-project.json 2>/dev/null || true)"
-            API_VER="${API_VER:-60.0}"
+            API_VER="${API_VER:-64.0}"
             
-            # Use echo. This is clean and avoids all indentation issues.
             echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
             <Package xmlns=\"http://soap.sforce.com/2006/04/metadata\">
               <version>${API_VER}</version>
