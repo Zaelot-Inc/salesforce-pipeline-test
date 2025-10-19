@@ -70,41 +70,46 @@ jobs:
           java-version: '11'
           distribution: 'zulu'
 
-      - name: Prepare refs (origin/main)
-        if: steps.touched.outputs.has_force_app == 'true'
+      - name: Prepare refs (origin/main + PR merge & head)
+        shell: bash
         run: |
           set -euo pipefail
           git fetch --no-tags origin main:refs/remotes/origin/main
-          git rev-parse --verify origin/main
-          echo "HEAD of PR: ${{ github.event.pull_request.head.sha }}"
+          git fetch --no-tags origin "refs/pull/${{ github.event.pull_request.number }}/merge:refs/remotes/origin/pr-${{ github.event.pull_request.number }}-merge"
+          git fetch --no-tags origin "refs/pull/${{ github.event.pull_request.number }}/head:refs/remotes/origin/pr-${{ github.event.pull_request.number }}-head"
+          git rev-parse --verify refs/remotes/origin/main
+          git rev-parse --verify refs/remotes/origin/pr-${{ github.event.pull_request.number }}-merge
+          git rev-parse --verify refs/remotes/origin/pr-${{ github.event.pull_request.number }}-head
+          echo "Using merge ref: refs/remotes/origin/pr-${{ github.event.pull_request.number }}-merge"
 
-      - name: Generate delta (origin/main -> PR head)
+      - name: Generate delta (origin/main -> PR merge)
         id: delta
+        shell: bash
         run: |
           set -euo pipefail
-          TO_SHA="${{ github.event.pull_request.head.sha }}"
-          echo "Generating delta: origin/main -> ${TO_SHA}"
+          rm -rf changed-sources
           mkdir -p changed-sources
           sf sgd source delta \
             --from "origin/main" \
-            --to   "${TO_SHA}" \
+            --to   "refs/remotes/origin/pr-${{ github.event.pull_request.number }}-merge" \
             --output "changed-sources" \
             --generate-delta \
             --source "force-app/"
 
-          has_addmods="false"
-          has_deletions="false"
+          echo "Delta contents:"
+          find changed-sources -maxdepth 3 -type f -print || true
 
+          # Outputs for later guards
           if [ -d changed-sources/force-app ] && [ -n "$(ls -A changed-sources/force-app || true)" ]; then
-            has_addmods="true"
+            echo "has_addmods=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_addmods=false" >> "$GITHUB_OUTPUT"
           fi
-          if [ -f "changed-sources/destructiveChanges/destructiveChanges.xml" ] || \
-            [ -f "changed-sources/destructiveChangesPost/destructiveChanges.xml" ]; then
-            has_deletions="true"
+          if [ -f "changed-sources/destructiveChanges/destructiveChanges.xml" ] || [ -f "changed-sources/destructiveChangesPost/destructiveChanges.xml" ]; then
+            echo "has_deletions=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_deletions=false" >> "$GITHUB_OUTPUT"
           fi
-
-          echo "has_addmods=$has_addmods"     >> "$GITHUB_OUTPUT"
-          echo "has_deletions=$has_deletions" >> "$GITHUB_OUTPUT"
 
 
       - name: Early exit if no metadata changes
@@ -128,16 +133,6 @@ jobs:
           [ -z "${SF_JWT_KEY_PROD:-}" ] && { echo "SF_JWT_KEY_PROD missing"; exit 1; }
           umask 177
           printf "%s" "$SF_JWT_KEY_PROD" > jwt_prod.key
-      - name: Sanity check JWT env
-        env:
-          SF_JWT_CLIENT_PROD: ${{ secrets.SF_JWT_CLIENT }}
-          SF_JWT_USERNAME_PROD: ${{ secrets.SF_JWT_USERNAME }}
-        run: |
-          echo "Endpoint: ${SF_LOGIN_URL_PROD}"
-          echo "Client ID length: ${#SF_JWT_CLIENT_PROD}"
-          echo "Username: ${#SF_JWT_USERNAME_PROD}"
-          openssl rsa -in jwt_prod.key -check -noout >/dev/null && echo "Private key OK" || (echo "Bad private key"; exit 1)
-          
       - name: Login to Production (JWT)
         if: steps.outputs.skip_process != 'true'
         env:
