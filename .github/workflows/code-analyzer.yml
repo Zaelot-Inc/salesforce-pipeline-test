@@ -6,16 +6,14 @@ on:
 
 jobs: 
   salesforce-code-analyzer-workflow:
+    if: github.event.pull_request.draft == 'false'
     permissions:
       pull-requests: write # Grants permission to create a pull request review. Only necessary if running against pull requests.
       contents: read # Grants permission to check out the repository. Only necessary for private repos.
       actions: read # Grants permission to read the in-progress actions. Only necessary for private repos.
     runs-on: ubuntu-latest
+
     steps:
-      - name: Check PR is Draft
-        id: check_draft
-        if: github.event.pull_request.draft == false
-        run: echo "is_draft=true" >> "$GITHUB_OUTPUT"
       - name: Check out files
         uses: actions/checkout@v4
         with:
@@ -26,7 +24,6 @@ jobs:
         id: changed
         with:
           script: |
-            echo "${{ steps.check_draft.outputs.is_draft }}""
             const pr = context.payload.pull_request;
             if (!pr) { core.setOutput('any_changed','false'); return; }
 
@@ -51,13 +48,13 @@ jobs:
 
       # 2) Short-circuit if nothing relevant changed
       - name: No relevant changes
-        if:  steps.check_draft.outputs.is_draft != 'true' && steps.changed.outputs.any_changed == 'false'
+        if: steps.changed.outputs.any_changed == 'false'
         run: echo "No Apex/LWC/JS changes — skipping." && exit 0
 
       # 3) Save and split the list (avoids overlong commands)
       - name: Prepare file lists
         id: targets
-        if:  steps.check_draft.outputs.is_draft != 'true' && steps.changed.outputs.any_changed == 'false'
+        if: steps.changed.outputs.any_changed == 'false'
         shell: bash
         run: |
           args=""
@@ -68,32 +65,32 @@ jobs:
           echo "args=${args}" >> "$GITHUB_OUTPUT"
       # PREREQUISITES - Only needed if the runner doesn't already satisfy these requirements.
       - name: Ensure node v20.9.0 or greater
-        if:  steps.check_draft.outputs.is_draft != 'true' && steps.changed.outputs.any_changed == 'false'
+        if: steps.changed.outputs.any_changed == 'false'
         uses: actions/setup-node@v4
         with:
           node-version: '>=20.9.0'
       - name: Ensure java v11 or greater
-        if:  steps.check_draft.outputs.is_draft != 'true' && steps.changed.outputs.any_changed == 'false'
+        if: steps.changed.outputs.any_changed == 'false'
         uses: actions/setup-java@v4
         with:
           java-version: '>=11'
           distribution: 'zulu'
       - name: Ensure python v3.10 or greater
-        if:  steps.check_draft.outputs.is_draft != 'true' && steps.changed.outputs.any_changed == 'false'
+        if: steps.changed.outputs.any_changed == 'false'
         uses: actions/setup-python@v5
         with:
           python-version: '>=3.10'
 
       - name: Install Salesforce CLI
-        if:  steps.check_draft.outputs.is_draft != 'true' && steps.changed.outputs.any_changed == 'false'
+        if: steps.changed.outputs.any_changed == 'false'
         run: npm install -g @salesforce/cli@latest
 
       - name: Install Latest Salesforce Code Analyzer CLI Plugin
-        if:  steps.check_draft.outputs.is_draft != 'true' && steps.changed.outputs.any_changed == 'false'
+        if: steps.changed.outputs.any_changed == 'false'
         run: sf plugins install code-analyzer@latest
 
       - name: Run Salesforce Code Analyzer
-        if:  steps.check_draft.outputs.is_draft != 'true' && steps.changed.outputs.any_changed == 'false'
+        if: steps.changed.outputs.any_changed == 'false'
         id: run-analyzer
         uses: forcedotcom/run-code-analyzer@v2
         with:
