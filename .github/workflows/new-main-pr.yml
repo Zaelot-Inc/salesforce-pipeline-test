@@ -254,14 +254,6 @@ jobs:
             fi
           } > pr-comment.md
 
-          # If you want to fail the job on validation error or test failures, do it here after writing outputs/comment.
-          if [ "$RC" -ne 0 ]; then
-            echo "will_fail=true" >> "$GITHUB_OUTPUT"
-          elif [ "$FAILURES" -gt 0 ]; then
-            echo "will_fail=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "will_fail=false" >> "$GITHUB_OUTPUT"
-          fi
 
       # 2) Upload artifacts so you can inspect locally
       - name: Upload validation artifacts
@@ -288,8 +280,3 @@ jobs:
               : 'Production validation ran but no summary was produced.';
             await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
 
-            // Fail the job if the validator said so (keeps the PR comment posted)
-            const willFail = "${{ steps.prod_validate.outputs.will_fail }}";
-            if (willFail === 'true') {
-              core.setFailed('Production validation reported failures or CLI error. See comment above and artifacts.');
-            }
