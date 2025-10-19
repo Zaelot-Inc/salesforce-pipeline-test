@@ -98,7 +98,7 @@ jobs:
         id: delta
         shell: bash
         run: |
-          set -euo pipefail
+          set -euo pipefail # This 'set -e' is the source of the problem
           rm -rf changed-sources
           mkdir -p changed-sources
           sf sgd source delta \
@@ -113,20 +113,31 @@ jobs:
           
           [ -d changed-sources/force-app ] && [ -n "$(ls -A changed-sources/force-app || true)" ] && has_addmods="true"
           
-          # --- FIXED LOGIC ---
-          # Check if the destructive file exists AND contains members before setting the flag
-          if [ -f changed-sources/destructiveChanges/destructiveChanges.xml ] && \
-             grep -q "<members>" changed-sources/destructiveChanges/destructiveChanges.xml; then
-            has_deletions="true"
-            echo 'This is not ' 
+          # --- FIXED LOGIC (set -e safe) ---
+          # We must use nested 'if' statements.
+          # 'set -e' will kill the script if 'grep' returns 1 (not found)
+          # when it's part of a '&&' chain.
 
+          echo "Checking for destructive changes..."
+
+          if [ -f changed-sources/destructiveChanges/destructiveChanges.xml ]; then
+            echo "Found destructiveChanges.xml, checking for <members>..."
+            if grep -q "<members>" changed-sources/destructiveChanges/destructiveChanges.xml; then
+              echo "Found <members> in destructiveChanges.xml."
+              has_deletions="true"
+            else
+              echo "File is empty or contains no <members>."
+            fi
           fi
-          echo 'This is ' 
-          echo has_deletions
           
-          if [ -f changed-sources/destructiveChangesPost/destructiveChanges.xml ] && \
-             grep -q "<members>" changed-sources/destructiveChangesPost/destructiveChanges.xml; then
-            has_deletions="true"
+          if [ -f changed-sources/destructiveChangesPost/destructiveChanges.xml ]; then
+            echo "Found destructiveChangesPost.xml, checking for <members>..."
+            if grep -q "<members>" changed-sources/destructiveChangesPost/destructiveChanges.xml; then
+              echo "Found <members> in destructiveChangesPost.xml."
+              has_deletions="true"
+            else
+              echo "File is empty or contains no <members>."
+            fi
           fi
           # --- END FIX ---
 
