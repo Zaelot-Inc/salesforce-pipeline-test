@@ -161,21 +161,21 @@ jobs:
           else
             # deletion-only changes -> synthesize a minimal, valid package.xml
             API_VER="$(jq -r '.sourceApiVersion // empty' sfdx-project.json 2>/dev/null || true)"
-            API_VER="${API_VER:-60.0}"
+            API_VER="${API_VER:-64.0}"
             cat > "${{ steps.naming.outputs.pkg_path }}" <<EOF
-            <?xml version="1.0" encoding="UTF-8"?>
-            <Package xmlns="http://soap.sforce.com/2006/04/metadata">
-              <version>${API_VER}</version>
-            </Package>
+              <?xml version="1.0" encoding="UTF-8"?>
+              <Package xmlns="http://soap.sforce.com/2006/04/metadata">
+                <version>${API_VER}</version>
+              </Package>
             EOF
-                      fi
+          fi
 
-                  - name: Create manifest/branch/<branch>-package-destructive.xml (if deletions)
-                    if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.has_deletions == 'true'
-                    shell: bash
-                    run: |
-                      set -euo pipefail
-                      python3 - <<'PY'
+      - name: Create manifest/branch/<branch>-package-destructive.xml (if deletions)
+        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.has_deletions == 'true'
+        shell: bash
+        run: |
+            set -euo pipefail
+            python3 - <<'PY'
             import os, json
             from xml.etree import ElementTree as ET
 
@@ -236,79 +236,79 @@ jobs:
                 f.write(xml if isinstance(xml, bytes) else xml.encode("utf-8"))
             PY
 
-                  - name: Can we push to this PR branch?
-                    id: canpush
-                    if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
-                    uses: actions/github-script@v7
-                    with:
-                      script: |
-                        const sameRepo = context.payload.pull_request.head.repo?.full_name === context.repo.owner + '/' + context.repo.repo;
-                        core.setOutput('same_repo', sameRepo ? 'true' : 'false');
+      - name: Can we push to this PR branch?
+        id: canpush
+        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sameRepo = context.payload.pull_request.head.repo?.full_name === context.repo.owner + '/' + context.repo.repo;
+            core.setOutput('same_repo', sameRepo ? 'true' : 'false');
 
-                  - name: Commit manifests into the PR branch
-                    if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true' && steps.canpush.outputs.same_repo == 'true'
-                    shell: bash
-                    env:
-                      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-                    run: |
-                      set -euo pipefail
-                      git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-                      git config user.name  "github-actions[bot]"
-                      git add -A -- "manifest/branch"
-                      if git diff --cached --quiet; then
-                        echo "Manifests unchanged; nothing to commit."
-                        exit 0
-                      fi
-                      git commit -m "chore(manifest): generate delta manifests for PR #${{ github.event.pull_request.number }}"
-                      git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+      - name: Commit manifests into the PR branch
+        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true' && steps.canpush.outputs.same_repo == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name  "github-actions[bot]"
+          git add -A -- "manifest/branch"
+          if git diff --cached --quiet; then
+            echo "Manifests unchanged; nothing to commit."
+            exit 0
+          fi
+          git commit -m "chore(manifest): generate delta manifests for PR #${{ github.event.pull_request.number }}"
+          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
 
-                  - name: Upload manifests as artifact (fork PRs / no push)
-                    if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true' && steps.canpush.outputs.same_repo != 'true'
-                    uses: actions/upload-artifact@v4
-                    with:
-                      name: pr-${{ github.event.pull_request.number }}-manifests
-                      path: |
-                        ${{ steps.naming.outputs.pkg_path }}
-                        ${{ steps.naming.outputs.dest_path }}
+      - name: Upload manifests as artifact (fork PRs / no push)
+        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true' && steps.canpush.outputs.same_repo != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-${{ github.event.pull_request.number }}-manifests
+          path: |
+            ${{ steps.naming.outputs.pkg_path }}
+            ${{ steps.naming.outputs.dest_path }}
 
-                  - name: Comment instructions on the PR
-                    if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
-                    uses: actions/github-script@v7
-                    with:
-                      script: |
-                        const fs = require('fs');
-                        const owner = context.repo.owner, repo = context.repo.repo;
-                        const number = context.payload.pull_request.number;
-                        const branch = "${{ steps.naming.outputs.branch_safe }}";
-                        const pkg = "${{ steps.naming.outputs.pkg_path }}";
-                        const dest = "${{ steps.naming.outputs.dest_path }}";
-                        const hasDel = "${{ steps.delta.outputs.has_deletions }}" === "true";
-                        const canPush = "${{ steps.canpush.outputs.same_repo }}" === "true";
-                        let body = `### 🔧 Deployment manifests generated for \`${branch}\`\n\n`;
-                        body += `- Package manifest: \`${pkg}\`\n`;
-                        if (hasDel && fs.existsSync(dest)) body += `- Destructive manifest: \`${dest}\`\n`;
-                        if (!canPush) body += `\n_(This PR comes from a fork, so the manifests were uploaded as a workflow artifact instead of being committed.)_\n`;
+      - name: Comment instructions on the PR
+        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const owner = context.repo.owner, repo = context.repo.repo;
+            const number = context.payload.pull_request.number;
+            const branch = "${{ steps.naming.outputs.branch_safe }}";
+            const pkg = "${{ steps.naming.outputs.pkg_path }}";
+            const dest = "${{ steps.naming.outputs.dest_path }}";
+            const hasDel = "${{ steps.delta.outputs.has_deletions }}" === "true";
+            const canPush = "${{ steps.canpush.outputs.same_repo }}" === "true";
+            let body = `### 🔧 Deployment manifests generated for \`${branch}\`\n\n`;
+            body += `- Package manifest: \`${pkg}\`\n`;
+            if (hasDel && fs.existsSync(dest)) body += `- Destructive manifest: \`${dest}\`\n`;
+            if (!canPush) body += `\n_(This PR comes from a fork, so the manifests were uploaded as a workflow artifact instead of being committed.)_\n`;
 
-                        body += `\n#### 🚀 How to deploy to **Production** with the \`sf\` CLI\n`;
-                        body += `> 1) **Authorize** your Prod org (once): \`sf org login jwt --username <user> --client-id <consumerKey> --jwt-key-file <keyfile> --alias Prod\`\n\n`;
+            body += `\n#### 🚀 How to deploy to **Production** with the \`sf\` CLI\n`;
+            body += `> 1) **Authorize** your Prod org (once): \`sf org login jwt --username <user> --client-id <consumerKey> --jwt-key-file <keyfile> --alias Prod\`\n\n`;
 
-                        if (!hasDel) {
-                          body += `**A. Validate (Quick-Deploy eligible)**\n`;
-                          body += "```bash\n";
-                          body += `sf project deploy validate \\\n  --manifest ${pkg} \\\n  --target-org Prod \\\n  --test-level RunLocalTests \\\n  --wait 120 \\\n  --json > validate.json\n`;
-                          body += "```\n";
-                        } else {
-                          body += `**A. Validate with destructive changes**\n`;
-                          body += "_Note: `project deploy validate` historically doesn't accept `--pre/--post-destructive-changes`, so use a check-only deploy which still produces a Quick-Deployable job id._\n";
-                          body += "```bash\n";
-                          body += `sf project deploy start \\\n  --manifest ${pkg} \\\n  --pre-destructive-changes ${dest} \\\n  --check-only \\\n  --target-org Prod \\\n  --test-level RunLocalTests \\\n  --wait 120 \\\n  --json > validate.json\n`;
-                          body += "```\n";
-                        }
+            if (!hasDel) {
+              body += `**A. Validate (Quick-Deploy eligible)**\n`;
+              body += "```bash\n";
+              body += `sf project deploy validate \\\n  --manifest ${pkg} \\\n  --target-org Prod \\\n  --test-level RunLocalTests \\\n  --wait 120 \\\n  --json > validate.json\n`;
+              body += "```\n";
+            } else {
+              body += `**A. Validate with destructive changes**\n`;
+              body += "_Note: `project deploy validate` historically doesn't accept `--pre/--post-destructive-changes`, so use a check-only deploy which still produces a Quick-Deployable job id._\n";
+              body += "```bash\n";
+              body += `sf project deploy start \\\n  --manifest ${pkg} \\\n  --pre-destructive-changes ${dest} \\\n  --check-only \\\n  --target-org Prod \\\n  --test-level RunLocalTests \\\n  --wait 120 \\\n  --json > validate.json\n`;
+              body += "```\n";
+            }
 
-                        body += `**B. Quick Deploy (within 10 days, unchanged org):**\n`;
-                        body += "```bash\n";
-                        body += `sf project deploy quick --target-org Prod --job-id $(jq -r '.result.id // .id' validate.json) --wait 120 --json\n`;
-                        body += "```\n";
-                        body += "\n(Replace `Prod` with your org alias. Save the job id from the validation JSON for quick deploy.)\n";
+            body += `**B. Quick Deploy (within 10 days, unchanged org):**\n`;
+            body += "```bash\n";
+            body += `sf project deploy quick --target-org Prod --job-id $(jq -r '.result.id // .id' validate.json) --wait 120 --json\n`;
+            body += "```\n";
+            body += "\n(Replace `Prod` with your org alias. Save the job id from the validation JSON for quick deploy.)\n";
 
-                        await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
+            await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
