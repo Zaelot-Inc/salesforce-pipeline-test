@@ -118,7 +118,11 @@ jobs:
           if [ -f changed-sources/destructiveChanges/destructiveChanges.xml ] && \
              grep -q "<members>" changed-sources/destructiveChanges/destructiveChanges.xml; then
             has_deletions="true"
+            echo 'This is not ' 
+
           fi
+          echo 'This is ' 
+          echo has_deletions
           
           if [ -f changed-sources/destructiveChangesPost/destructiveChanges.xml ] && \
              grep -q "<members>" changed-sources/destructiveChangesPost/destructiveChanges.xml; then
