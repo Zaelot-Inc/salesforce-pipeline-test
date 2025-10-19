@@ -5,7 +5,6 @@ from xml.etree import ElementTree as ET
 dest = os.environ.get("DEST_PATH")
 if not dest:
     print("Error: DEST_PATH environment variable not set or is empty.")
-    print("This must be set in the 'env:' block of the GitHub Actions workflow.")
     exit(1)
 
 # --- The rest of your script ---
@@ -16,9 +15,9 @@ def read_api_ver():
         with open("sfdx-project.json","r") as f:
             data = json.load(f)
             v = data.get("sourceApiVersion")
-            return str(v) if v else "60.0"
+            return str(v) if v else "64.0"
     except Exception:
-        return "60.0"
+        return "64.0"
 
 def collect(path):
     items = {}
