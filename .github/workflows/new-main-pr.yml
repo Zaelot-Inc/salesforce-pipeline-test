@@ -1,22 +1,25 @@
-name: Generate deploy manifests + PR instructions (no auto validation)
+name: Validate release PR against Production (check-only)
 
 on:
   pull_request:
     branches: [ main ]
     types: [ opened, reopened, synchronize, ready_for_review ]
+    # this filter already helps, but we also add a runtime guard below
 
 permissions:
-  contents: write          # we commit manifests into the PR branch (same-repo PRs)
+  contents: read
   pull-requests: write
 
 concurrency:
-  group: 'main-pr-manifests-${{ github.event.pull_request.number }}'
+  group: 'prod-validate-pr-${{ github.event.pull_request.number }}'
   cancel-in-progress: true
 
 jobs:
-  build-manifests-and-comment:
-    name: Build delta manifests + PR comment
+  prod-validate:
+    name: Prod validate-only (origin/main -> PR head)
     runs-on: ubuntu-latest
+    env:
+      SF_LOGIN_URL_PROD: "https://test.salesforce.com"
 
     steps:
       - name: Checkout PR head
@@ -24,7 +27,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Quick guard: does the PR touch force-app at all?
+      # NEW: detect whether the PR actually touches force-app/**
       - name: Detect force-app changes
         id: touched
         uses: actions/github-script@v7
@@ -33,15 +36,12 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const number = context.payload.pull_request.number;
-            const files = await github.paginate(
-              github.rest.pulls.listFiles,
-              { owner, repo, pull_number: number, per_page: 100 }
-            );
+            const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: number, per_page: 100 });
             const hasForceApp = files.some(f => f.filename.startsWith('force-app/'));
             core.setOutput('has_force_app', hasForceApp ? 'true' : 'false');
 
-      # If NO force-app changes at all, exit gracefully
-      - name: No force-app changes (success)
+      # If NO force-app changes, succeed and stop
+      - name:  no force-app changes (success)
         if: steps.touched.outputs.has_force_app != 'true'
         uses: actions/github-script@v7
         with:
@@ -50,8 +50,9 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.pull_request.number,
-              body: "ℹ️ Skipping manifest generation: this PR does not touch `force-app/**`."
+              body: "ℹ️ Skipping Production validation: this PR does not touch `force-app/**`."
             });
+            // success by default (no failure)
 
       - name: Install requirements (sf CLI, sfdx-git-delta, jq)
         if: steps.touched.outputs.has_force_app == 'true'
@@ -62,27 +63,28 @@ jobs:
           npm i -g @salesforce/cli@latest
           echo y | sf plugins install sfdx-git-delta || true
 
-      - name: Ensure Java 11 (needed by some plugins)
+      - name: Ensure Java 11+
         if: steps.touched.outputs.has_force_app == 'true'
         uses: actions/setup-java@v4
         with:
           java-version: '11'
           distribution: 'zulu'
 
-      # Prefer the "PR merge" ref (what will land); fallback to PR head if merge ref isn't available.
       - name: Prepare refs (origin/main + PR merge, with fallback to head)
-        if: steps.touched.outputs.has_force_app == 'true'
         shell: bash
         env:
-          PR_NUM:   ${{ github.event.pull_request.number }}
-          GH_REPO:  ${{ github.repository }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git"
+
+          # Base
           git fetch --no-tags origin main:refs/remotes/origin/main
           git rev-parse --verify refs/remotes/origin/main
 
+          # Try MERGE ref (what will land)
           if git fetch --no-tags origin "refs/pull/${PR_NUM}/merge:refs/remotes/origin/pr-${PR_NUM}-merge"; then
             echo "TO_REF=refs/remotes/origin/pr-${PR_NUM}-merge" >> "$GITHUB_ENV"
             echo "Using PR merge ref."
@@ -93,12 +95,14 @@ jobs:
             echo "TO_REF=refs/remotes/origin/pr-${PR_NUM}-head" >> "$GITHUB_ENV"
           fi
 
+          echo "Base SHA: $(git rev-parse --short refs/remotes/origin/main)"
+          echo "To   SHA: $(git rev-parse --short $(sed -n 's/^TO_REF=//p' "$GITHUB_ENV"))"
+
+
       - name: Generate delta (origin/main -> $TO_REF)
-        if: steps.touched.outputs.has_force_app == 'true'
-        id: delta
         shell: bash
         run: |
-          set -euo pipefail # This 'set -e' is the source of the problem
+          set -euo pipefail
           rm -rf changed-sources
           mkdir -p changed-sources
           sf sgd source delta \
@@ -108,46 +112,10 @@ jobs:
             --generate-delta \
             --source "force-app/"
 
-          has_addmods="false"
-          has_deletions="false"
-          
-          [ -d changed-sources/force-app ] && [ -n "$(ls -A changed-sources/force-app || true)" ] && has_addmods="true"
-          
-          # --- FIXED LOGIC (set -e safe) ---
-          # We must use nested 'if' statements.
-          # 'set -e' will kill the script if 'grep' returns 1 (not found)
-          # when it's part of a '&&' chain.
-
-          echo "Checking for destructive changes..."
-
-          if [ -f changed-sources/destructiveChanges/destructiveChanges.xml ]; then
-            echo "Found destructiveChanges.xml, checking for <members>..."
-            if grep -q "<members>" changed-sources/destructiveChanges/destructiveChanges.xml; then
-              echo "Found <members> in destructiveChanges.xml."
-              has_deletions="true"
-            else
-              echo "File is empty or contains no <members>."
-            fi
-          fi
-          
-          if [ -f changed-sources/destructiveChangesPost/destructiveChanges.xml ]; then
-            echo "Found destructiveChangesPost.xml, checking for <members>..."
-            if grep -q "<members>" changed-sources/destructiveChangesPost/destructiveChanges.xml; then
-              echo "Found <members> in destructiveChangesPost.xml."
-              has_deletions="true"
-            else
-              echo "File is empty or contains no <members>."
-            fi
-          fi
-          # --- END FIX ---
-
-          echo "has_addmods=${has_addmods}"     >> "$GITHUB_OUTPUT"
-          echo "has_deletions=${has_deletions}" >> "$GITHUB_OUTPUT"
-
-          if [ "${has_addmods}" != "true" ] && [ "${has_deletions}" != "true" ]; then
-            echo "no_changes=true" >> "$GITHUB_OUTPUT"
-          else
+          if [ -d changed-sources/force-app ] && [ -n "$(ls -A changed-sources/force-app || true)" ]; then
             echo "no_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "no_changes=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Early exit if no metadata changes
@@ -155,141 +123,105 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const {owner, repo} = context.repo;
+            const owner = context.repo.owner, repo = context.repo.repo;
             const number = context.payload.pull_request.number;
-            await github.rest.issues.createComment({
-              owner, repo, issue_number: number,
-              body: "ℹ️ No delta found between `main` and this PR — no manifests generated."
-            });
+            const body = "ℹ️ No deployable metadata differences detected between `main` and this PR — skipping Production validation.";
+            await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
 
-      - name: Build branch-safe name + output paths
+      - name: Write Prod JWT key
         if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
-        id: naming
-        shell: bash
+        env:
+          SF_JWT_KEY_PROD: ${{ secrets.SF_JWT_KEY }}
         run: |
           set -euo pipefail
-          RAW="${{ github.event.pull_request.head.ref }}"
-          SAFE="$(printf "%s" "$RAW" | sed -E 's/[^A-Za-z0-9._-]+/-/g')"
-          PKG="manifest/branch/${SAFE}-package.xml"
-          DEST="manifest/branch/${SAFE}-package-destructive.xml"
-          echo "branch_raw=${RAW}"  >> "$GITHUB_OUTPUT"
-          echo "branch_safe=${SAFE}" >> "$GITHUB_OUTPUT"
-          echo "pkg_path=${PKG}"     >> "$GITHUB_OUTPUT"
-          echo "dest_path=${DEST}"   >> "$GITHUB_OUTPUT"
+          [ -z "${SF_JWT_KEY_PROD:-}" ] && { echo "SF_JWT_KEY_PROD missing"; exit 1; }
+          umask 177
+          printf "%s" "$SF_JWT_KEY_PROD" > jwt_prod.key
 
-      - name: Create manifest/branch/<branch>-package.xml (adds/mods)
+      - name: Login to Production (JWT)
         if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
-        shell: bash
+        env:
+          SF_JWT_CLIENT_PROD: ${{ secrets.SF_JWT_CLIENT }}
+          SF_JWT_USERNAME_PROD: ${{ secrets.SF_JWT_USERNAME }}
         run: |
           set -euo pipefail
-          mkdir -p "$(dirname "${{ steps.naming.outputs.pkg_path }}")"
-          if [ -f "changed-sources/package/package.xml" ]; then
-            cp "changed-sources/package/package.xml" "${{ steps.naming.outputs.pkg_path }}"
+          sf org login jwt \
+            --username "$SF_JWT_USERNAME_PROD" \
+            --client-id "$SF_JWT_CLIENT_PROD" \
+            --jwt-key-file jwt_prod.key \
+            --instance-url "${SF_LOGIN_URL_PROD}" \
+            --alias ProdForValidation --set-default --json
+
+      - name: Validate-only deploy to Production (check-only) and persist JSON
+        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
+        run: |
+          set -euo pipefail
+          PROD_VALIDATION_FILE=prod-validate.json
+          sf project deploy start \
+            --source-dir "changed-sources/force-app" \
+            --target-org ProdForValidation \
+            --dry-run \
+            --test-level RunLocalTests \
+            --wait 120 \
+            --json > "${PROD_VALIDATION_FILE}"
+
+          if [ -s "${PROD_VALIDATION_FILE}" ] && jq -e . >/dev/null 2>&1 < "${PROD_VALIDATION_FILE}"; then
+            status=$(jq -r '.status // .result.status // "unknown"' "${PROD_VALIDATION_FILE}" || echo "unknown")
+            failures=$(jq '.result.details.runTestResult.failures | length // 0' "${PROD_VALIDATION_FILE}" || echo 0)
+            echo "Validation status: ${status}; failures: ${failures}"
           else
-            # deletion-only changes -> synthesize a minimal, valid package.xml
-            API_VER="$(jq -r '.sourceApiVersion // empty' sfdx-project.json 2>/dev/null || true)"
-            API_VER="${API_VER:-64.0}"
-            
-            echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-            <Package xmlns=\"http://soap.sforce.com/2006/04/metadata\">
-              <version>${API_VER}</version>
-            </Package>" > "${{ steps.naming.outputs.pkg_path }}"
+            echo "prod-validate.json missing/invalid"; exit 1
           fi
 
-      - name: Create manifest/branch/<branch>-package-destructive.xml (if deletions)
-        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.has_deletions == 'true'
-        shell: bash
-        env:
-          # This correctly passes the variable TO the Python script
-          DEST_PATH: ${{ steps.naming.outputs.dest_path }}
-        run: |
-          set -euo pipefail
-          
-          # This is a debug step, "checking the obvious"
-          echo "DEST_PATH is set to: ${DEST_PATH}"
-          
-          # Now, execute the Python script
-          python3 .github/scripts/merge_destructive.py
-      - name: Can we push to this PR branch?
-        id: canpush
+      - name: Upload prod validation JSON artifact
         if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const sameRepo = context.payload.pull_request.head.repo?.full_name === context.repo.owner + '/' + context.repo.repo;
-            core.setOutput('same_repo', sameRepo ? 'true' : 'false');
-
-      - name: Commit manifests into the PR branch
-        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true' && steps.canpush.outputs.same_repo == 'true'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config user.name  "github-actions[bot]"
-          git add -A -- "manifest/branch"
-          if git diff --cached --quiet; then
-            echo "Manifests unchanged; nothing to commit."
-            exit 0
-          fi
-          git commit -m "chore(manifest): generate delta manifests for PR #${{ github.event.pull_request.number }}"
-          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
-
-      - name: Upload manifests as artifact (fork PRs / no push)
-        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true' && steps.canpush.outputs.same_repo != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: pr-${{ github.event.pull_request.number }}-manifests
-          path: |
-            ${{ steps.naming.outputs.pkg_path }}
-            ${{ steps.naming.outputs.dest_path }}
-      - name: Comment instructions on the PR
+          name: prod-validate-json-pr-${{ github.event.pull_request.number }}
+          path: prod-validate.json
+
+      - name: Comment results on the PR and fail on test errors
         if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const { owner, repo } = context.repo;
+            const owner = context.repo.owner, repo = context.repo.repo;
             const number = context.payload.pull_request.number;
+            const file = 'prod-validate.json';
 
-            // Get all your variables from previous steps
-            const branch = "${{ steps.naming.outputs.branch_safe }}";
-            const pkg = "${{ steps.naming.outputs.pkg_path }}";
-            const dest = "${{ steps.naming.outputs.dest_path }}";
-            const hasDel = "${{ steps.delta.outputs.has_deletions }}" === "true";
-            const canPush = "${{ steps.canpush.outputs.same_repo }}" === "true";
-
-            // Read the template file from the repository
-            let body = fs.readFileSync('.github/templates/how-to-deploy-prod.md', 'utf8');
-
-            // --- Helper function to remove conditional blocks ---
-            const removeBlock = (tag, content) => {
-              const regex = new RegExp(`<!-- ${tag} -->[\\s\\S]*?<!-- END${tag} -->`, 'g');
-              return content.replace(regex, '');
-            };
-            
-            // --- 1. Handle Conditional Blocks ---
-            if (hasDel) {
-              // Deletions exist: remove the "no destructive" block and the "destructive" line
-              body = removeBlock('IF_NO_DESTRUCTIVE', body);
+            let body = "### Production validation result\n\n";
+            if (fs.existsSync(file)) {
+              try {
+                const data = JSON.parse(fs.readFileSync(file,'utf8'));
+                const failures = (((data || {}).result || {}).details || {}).runTestResult?.failures || [];
+                const deployStatus = data?.status || (data?.result?.status) || 'unknown';
+                body += `Status: **${deployStatus}**\n\n`;
+                if (failures.length) {
+                  body += `Found **${failures.length}** failing Apex test(s):\n\n| Class | Method | Message |\n|---|---|---|\n`;
+                  for (const f of failures.slice(0,30)) {
+                    const msg = String(f.message || '').replace(/\n/g, ' ').slice(0,500);
+                    body += `| ${f.name} | ${f.methodName} | ${msg} |\n`;
+                  }
+                  body += `\n(Full validation JSON uploaded as artifact)\n`;
+                } else {
+                  body += "No Apex test failures found.\n";
+                }
+                await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
+                if (failures.length) {
+                  core.setFailed(`Prod validation reported ${failures.length} Apex failures.`);
+                }
+              } catch (e) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: number,
+                  body: `Could not parse prod-validate.json: ${e.message}`
+                });
+                core.setFailed('Invalid validation JSON.');
+              }
             } else {
-              // No deletions: remove the "destructive" blocks
-              body = removeBlock('IF_DESTRUCTIVE', body);
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: number,
+                body: "No prod-validate.json produced; check workflow logs."
+              });
+              core.setFailed('No validation JSON produced.');
             }
-            
-            if (canPush) {
-              // It's a same-repo PR, so remove the "fork" message
-              body = removeBlock('IF_FORK_PR', body);
-            }
-            
-            // Clean up any remaining conditional tags (the ones we decided to keep)
-            body = body.replace(/<!-- \/?IF_.*? -->/g, '');
-
-            // --- 2. Replace Placeholders ---
-            body = body.replace(/{{BRANCH_SAFE}}/g, branch);
-            body = body.replace(/{{PKG_PATH}}/g, pkg);
-            body = body.replace(/{{DEST_PATH}}/g, dest);
-
-            // --- 3. Post the Comment ---
-            await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
