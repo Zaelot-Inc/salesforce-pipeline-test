@@ -24,9 +24,9 @@ jobs:
       # 1) Collect changed files in the PR
       - uses: actions/github-script@v7
         id: changed
-        if: steps.check_draft.outputs.is_draft != 'true'
         with:
           script: |
+            echo "${{ steps.check_draft.outputs.is_draft }}""
             const pr = context.payload.pull_request;
             if (!pr) { core.setOutput('any_changed','false'); return; }
 
