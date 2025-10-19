@@ -167,7 +167,7 @@ jobs:
               <Package xmlns="http://soap.sforce.com/2006/04/metadata">
                 <version>${API_VER}</version>
               </Package>
-            EOF
+EOF
           fi
 
       - name: Create manifest/branch/<branch>-package-destructive.xml (if deletions)
@@ -234,7 +234,7 @@ jobs:
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             with open(dest, "wb") as f:
                 f.write(xml if isinstance(xml, bytes) else xml.encode("utf-8"))
-            PY
+PY
 
       - name: Can we push to this PR branch?
         id: canpush
