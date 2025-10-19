@@ -244,45 +244,52 @@ jobs:
           path: |
             ${{ steps.naming.outputs.pkg_path }}
             ${{ steps.naming.outputs.dest_path }}
-
       - name: Comment instructions on the PR
         if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const owner = context.repo.owner, repo = context.repo.repo;
+            const { owner, repo } = context.repo;
             const number = context.payload.pull_request.number;
+
+            // Get all your variables from previous steps
             const branch = "${{ steps.naming.outputs.branch_safe }}";
             const pkg = "${{ steps.naming.outputs.pkg_path }}";
             const dest = "${{ steps.naming.outputs.dest_path }}";
             const hasDel = "${{ steps.delta.outputs.has_deletions }}" === "true";
             const canPush = "${{ steps.canpush.outputs.same_repo }}" === "true";
-            let body = `### 🔧 Deployment manifests generated for \`${branch}\`\n\n`;
-            body += `- Package manifest: \`${pkg}\`\n`;
-            if (hasDel && fs.existsSync(dest)) body += `- Destructive manifest: \`${dest}\`\n`;
-            if (!canPush) body += `\n_(This PR comes from a fork, so the manifests were uploaded as a workflow artifact instead of being committed.)_\n`;
 
-            body += `\n#### 🚀 How to deploy to **Production** with the \`sf\` CLI\n`;
-            body += `> 1) **Authorize** your Prod org (once): \`sf org login jwt --username <user> --client-id <consumerKey> --jwt-key-file <keyfile> --alias Prod\`\n\n`;
+            // Read the template file from the repository
+            let body = fs.readFileSync('.github/pr-comment-template.md', 'utf8');
 
-            if (!hasDel) {
-              body += `**A. Validate (Quick-Deploy eligible)**\n`;
-              body += "```bash\n";
-              body += `sf project deploy validate \\\n  --manifest ${pkg} \\\n  --target-org Prod \\\n  --test-level RunLocalTests \\\n  --wait 120 \\\n  --json > validate.json\n`;
-              body += "```\n";
+            // --- Helper function to remove conditional blocks ---
+            const removeBlock = (tag, content) => {
+              const regex = new RegExp(`<!-- ${tag} -->[\\s\\S]*?<!-- END${tag} -->`, 'g');
+              return content.replace(regex, '');
+            };
+            
+            // --- 1. Handle Conditional Blocks ---
+            if (hasDel) {
+              // Deletions exist: remove the "no destructive" block and the "destructive" line
+              body = removeBlock('IF_NO_DESTRUCTIVE', body);
             } else {
-              body += `**A. Validate with destructive changes**\n`;
-              body += "_Note: `project deploy validate` historically doesn't accept `--pre/--post-destructive-changes`, so use a check-only deploy which still produces a Quick-Deployable job id._\n";
-              body += "```bash\n";
-              body += `sf project deploy start \\\n  --manifest ${pkg} \\\n  --pre-destructive-changes ${dest} \\\n  --check-only \\\n  --target-org Prod \\\n  --test-level RunLocalTests \\\n  --wait 120 \\\n  --json > validate.json\n`;
-              body += "```\n";
+              // No deletions: remove the "destructive" blocks
+              body = removeBlock('IF_DESTRUCTIVE', body);
             }
+            
+            if (canPush) {
+              // It's a same-repo PR, so remove the "fork" message
+              body = removeBlock('IF_FORK_PR', body);
+            }
+            
+            // Clean up any remaining conditional tags (the ones we decided to keep)
+            body = body.replace(/<!-- \/?IF_.*? -->/g, '');
 
-            body += `**B. Quick Deploy (within 10 days, unchanged org):**\n`;
-            body += "```bash\n";
-            body += `sf project deploy quick --target-org Prod --job-id $(jq -r '.result.id // .id' validate.json) --wait 120 --json\n`;
-            body += "```\n";
-            body += "\n(Replace `Prod` with your org alias. Save the job id from the validation JSON for quick deploy.)\n";
+            // --- 2. Replace Placeholders ---
+            body = body.replace(/{{BRANCH_SAFE}}/g, branch);
+            body = body.replace(/{{PKG_PATH}}/g, pkg);
+            body = body.replace(/{{DEST_PATH}}/g, dest);
 
+            // --- 3. Post the Comment ---
             await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
