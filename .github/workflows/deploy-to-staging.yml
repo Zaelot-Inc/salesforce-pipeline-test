@@ -83,7 +83,7 @@ jobs:
             --json --set-default
 
       # Deploy source to Staging org (SAVE JSON)
-      - name: Deploy the delta to Staging org
+      - name: Deploy to Staging
         run: |
           echo "Deploying source code to Staging org..."
           sf project deploy start \
@@ -93,6 +93,10 @@ jobs:
             --json > staging-deploy.json
           echo "Wrote staging-deploy.json"
 
+      - name: Show Staging Deploy Results
+        if: always() # This makes sure the step runs even if the previous one fails
+        run: |
+          cat staging-deploy.json
       # Summarize Apex failures -> GitHub Annotations (and fail job)
       - name: Summarize Apex test failures (annotations)
         if: always()
