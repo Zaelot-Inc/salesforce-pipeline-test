@@ -261,7 +261,7 @@ jobs:
             const canPush = "${{ steps.canpush.outputs.same_repo }}" === "true";
 
             // Read the template file from the repository
-            let body = fs.readFileSync('.github/template/how-to-deploy-prod.md', 'utf8');
+            let body = fs.readFileSync('.github/templates/how-to-deploy-prod.md', 'utf8');
 
             // --- Helper function to remove conditional blocks ---
             const removeBlock = (tag, content) => {
