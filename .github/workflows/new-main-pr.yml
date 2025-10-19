@@ -289,7 +289,6 @@ jobs:
             await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
 
             // Fail the job if the validator said so (keeps the PR comment posted)
-            const core = require('@actions/core');
             const willFail = "${{ steps.prod_validate.outputs.will_fail }}";
             if (willFail === 'true') {
               core.setFailed('Production validation reported failures or CLI error. See comment above and artifacts.');
