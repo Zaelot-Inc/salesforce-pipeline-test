@@ -98,7 +98,7 @@ jobs:
         id: delta
         shell: bash
         run: |
-          set -euo pipefail
+          set -euo pipefile
           rm -rf changed-sources
           mkdir -p changed-sources
           sf sgd source delta \
@@ -110,9 +110,21 @@ jobs:
 
           has_addmods="false"
           has_deletions="false"
+          
           [ -d changed-sources/force-app ] && [ -n "$(ls -A changed-sources/force-app || true)" ] && has_addmods="true"
-          [ -f changed-sources/destructiveChanges/destructiveChanges.xml ] && has_deletions="true"
-          [ -f changed-sources/destructiveChangesPost/destructiveChanges.xml ] && has_deletions="true"
+          
+          # --- FIXED LOGIC ---
+          # Check if the destructive file exists AND contains members before setting the flag
+          if [ -f changed-sources/destructiveChanges/destructiveChanges.xml ] && \
+             grep -q "<members>" changed-sources/destructiveChanges/destructiveChanges.xml; then
+            has_deletions="true"
+          fi
+          
+          if [ -f changed-sources/destructiveChangesPost/destructiveChanges.xml ] && \
+             grep -q "<members>" changed-sources/destructiveChangesPost/destructiveChanges.xml; then
+            has_deletions="true"
+          fi
+          # --- END FIX ---
 
           echo "has_addmods=${has_addmods}"     >> "$GITHUB_OUTPUT"
           echo "has_deletions=${has_deletions}" >> "$GITHUB_OUTPUT"
