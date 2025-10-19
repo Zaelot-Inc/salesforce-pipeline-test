@@ -6,7 +6,7 @@ on:
 
 jobs: 
   salesforce-code-analyzer-workflow:
-    if: github.event.pull_request.draft == 'false'
+    if: github.event.pull_request.draft == false
     permissions:
       pull-requests: write # Grants permission to create a pull request review. Only necessary if running against pull requests.
       contents: read # Grants permission to check out the repository. Only necessary for private repos.
