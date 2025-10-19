@@ -162,12 +162,12 @@ jobs:
             # deletion-only changes -> synthesize a minimal, valid package.xml
             API_VER="$(jq -r '.sourceApiVersion // empty' sfdx-project.json 2>/dev/null || true)"
             API_VER="${API_VER:-64.0}"
-            cat > "${{ steps.naming.outputs.pkg_path }}" <<EOF
+            cat > "${{ steps.naming.outputs.pkg_path }}" <<-EOF
               <?xml version="1.0" encoding="UTF-8"?>
               <Package xmlns="http://soap.sforce.com/2006/04/metadata">
                 <version>${API_VER}</version>
               </Package>
-EOF
+            EOF
           fi
 
       - name: Create manifest/branch/<branch>-package-destructive.xml (if deletions)
@@ -176,65 +176,65 @@ EOF
         run: |
             set -euo pipefail
             python3 - <<'PY'
-            import os, json
-            from xml.etree import ElementTree as ET
+              import os, json
+              from xml.etree import ElementTree as ET
 
-            NS = {"m":"http://soap.sforce.com/2006/04/metadata"}
-            def read_api_ver():
-                try:
-                    with open("sfdx-project.json","r") as f:
-                        data = json.load(f)
-                        v = data.get("sourceApiVersion")
-                        return str(v) if v else "60.0"
-                except Exception:
-                    return "60.0"
+              NS = {"m":"http://soap.sforce.com/2006/04/metadata"}
+              def read_api_ver():
+                  try:
+                      with open("sfdx-project.json","r") as f:
+                          data = json.load(f)
+                          v = data.get("sourceApiVersion")
+                          return str(v) if v else "60.0"
+                  except Exception:
+                      return "60.0"
 
-            def collect(path):
-                items = {}
-                if not os.path.isfile(path): return items
-                try:
-                    root = ET.parse(path).getroot()
-                    for t in root.findall("m:types", NS):
-                        name = (t.find("m:name", NS).text or "").strip()
-                        if not name: continue
-                        items.setdefault(name, set())
-                        for mem in t.findall("m:members", NS):
-                            m = (mem.text or "").strip()
-                            if m: items[name].add(m)
-                except Exception:
-                    pass
-                return items
+              def collect(path):
+                  items = {}
+                  if not os.path.isfile(path): return items
+                  try:
+                      root = ET.parse(path).getroot()
+                      for t in root.findall("m:types", NS):
+                          name = (t.find("m:name", NS).text or "").strip()
+                          if not name: continue
+                          items.setdefault(name, set())
+                          for mem in t.findall("m:members", NS):
+                              m = (mem.text or "").strip()
+                              if m: items[name].add(m)
+                  except Exception:
+                      pass
+                  return items
 
-            merged = {}
-            for p in [
-                "changed-sources/destructiveChanges/destructiveChanges.xml",
-                "changed-sources/destructiveChangesPost/destructiveChanges.xml"
-            ]:
-                sub = collect(p)
-                for k,v in sub.items():
-                    merged.setdefault(k, set()).update(v)
+              merged = {}
+              for p in [
+                  "changed-sources/destructiveChanges/destructiveChanges.xml",
+                  "changed-sources/destructiveChangesPost/destructiveChanges.xml"
+              ]:
+                  sub = collect(p)
+                  for k,v in sub.items():
+                      merged.setdefault(k, set()).update(v)
 
-            api_ver = read_api_ver()
-            pkg = ET.Element("Package", xmlns=NS["m"])
-            for tname in sorted(merged.keys()):
-                t = ET.SubElement(pkg, "types")
-                for m in sorted(merged[tname]):
-                    ET.SubElement(t, "members").text = m
-                ET.SubElement(t, "name").text = tname
-            ET.SubElement(pkg, "version").text = api_ver
+              api_ver = read_api_ver()
+              pkg = ET.Element("Package", xmlns=NS["m"])
+              for tname in sorted(merged.keys()):
+                  t = ET.SubElement(pkg, "types")
+                  for m in sorted(merged[tname]):
+                      ET.SubElement(t, "members").text = m
+                  ET.SubElement(t, "name").text = tname
+              ET.SubElement(pkg, "version").text = api_ver
 
-            xml = ET.tostring(pkg, encoding="utf-8")
-            try:
-                from xml.dom import minidom
-                xml = minidom.parseString(xml).toprettyxml(indent="  ", encoding="utf-8")
-            except Exception:
-                pass
+              xml = ET.tostring(pkg, encoding="utf-8")
+              try:
+                  from xml.dom import minidom
+                  xml = minidom.parseString(xml).toprettyxml(indent="  ", encoding="utf-8")
+              except Exception:
+                  pass
 
-            dest = os.environ.get("DEST_PATH", "${{ steps.naming.outputs.dest_path }}")
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with open(dest, "wb") as f:
-                f.write(xml if isinstance(xml, bytes) else xml.encode("utf-8"))
-PY
+              dest = os.environ.get("DEST_PATH", "${{ steps.naming.outputs.dest_path }}")
+              os.makedirs(os.path.dirname(dest), exist_ok=True)
+              with open(dest, "wb") as f:
+                  f.write(xml if isinstance(xml, bytes) else xml.encode("utf-8"))
+            PY
 
       - name: Can we push to this PR branch?
         id: canpush
