@@ -10,7 +10,7 @@ on:
 
 # Jobs to be executed
 jobs:
-  deploy-branch-to-int-and-staging-orgs:
+  deploy-branch-to-staging-org:
     runs-on: ubuntu-latest
     if: ${{ github.actor != 'dependabot[bot]' }}
     steps:
@@ -18,7 +18,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '>=20.9.0'
-
+          
       - name: Ensure java v11 or greater
         uses: actions/setup-java@v4
         with:
@@ -156,7 +156,6 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const core = require('@actions/core');
 
             // Load JSON if present
             const path = 'staging-deploy.json';
