@@ -98,7 +98,7 @@ jobs:
         id: delta
         shell: bash
         run: |
-          set -euo pipefile
+          set -euo pipefail
           rm -rf changed-sources
           mkdir -p changed-sources
           sf sgd source delta \
