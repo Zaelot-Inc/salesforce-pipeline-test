@@ -120,29 +120,7 @@ jobs:
             echo "No Apex test failures 🎉"
           fi
 
-      # Deploy destructive changes (if any) to Staging org (SAVE JSON)
-      - name: Deploy destructive changes (if any) to Staging org
-        if: ${{ hashFiles('changed-sources/destructiveChanges/destructiveChanges.xml') != '' }}
-        shell: bash
-        run: |
-          echo "Found destructive changes. Deploying..."
-          sf project deploy start \
-            --metadata-dir "changed-sources/destructiveChanges" \
-            --check-only \
-            --ignore-warnings \
-            --wait 120 \
-            --json > staging-destructive.json
-
-          DEPLOY_ID=$(jq -r '.result.id // .result.deploymentId // .id // empty' staging-destructive.json)
-          if [ -z "$DEPLOY_ID" ]; then
-            echo "Could not find deploy id in JSON:"; cat staging-destructive.json; exit 1
-          fi
-          echo "destructive_deploy_id=$DEPLOY_ID" >> $GITHUB_ENV
-
-      - name: Skip destructive deploy if no changes
-        if: ${{ hashFiles('changed-sources/destructiveChanges/destructiveChanges.xml') == '' }}
-        run: echo "No destructiveChanges.xml found — skipping destructive deployment."
-
+      
       # Upload JSON artifacts (optional, helps debugging)
       - name: Upload JSON results
         if: always()
@@ -151,62 +129,6 @@ jobs:
           name: staging-deploy-json
           path: |
             staging-deploy.json
-            staging-destructive.json
 
-      # 💬 Post a PR comment with failures table (find PR by commit on staging)
-      - name: Comment PR with test failures
-        if: always()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
 
-            // Load JSON if present
-            const path = 'staging-deploy.json';
-            let fails = [];
-            if (fs.existsSync(path)) {
-              try {
-                const data = JSON.parse(fs.readFileSync(path, 'utf8'));
-                fails = (((data || {}).result || {}).details || {}).runTestResult?.failures || [];
-              } catch (e) {
-                core.warning('Could not parse staging-deploy.json: ' + e.message);
-              }
-            }
-
-            // Find the PR(s) associated with this commit (the merge to staging)
-            const {owner, repo} = context.repo;
-            const sha = context.sha;
-            const resp = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
-            const prs = (resp.data || []).filter(pr => pr.base?.ref === 'staging');
-
-            if (!prs.length) {
-              core.info('No associated PR to staging found for this commit; skipping PR comment.');
-              return;
-            }
-
-            // Pick the most recent PR
-            const pr = prs.sort((a,b)=> new Date(b.updated_at) - new Date(a.updated_at))[0];
-
-            // Build body
-            if (!fails.length) {
-              const okBody = `✅ **Staging deploy validation**\nNo Apex test failures detected for commit \`${sha.slice(0,7)}\`.`;
-              await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body: okBody });
-              return;
-            }
-
-            let body = `### ❌ Apex test failures (${fails.length}) for staging deploy\n` +
-                       `Commit: \`${sha}\`\n\n` +
-                       `| Class | Method | Message |\n|---|---|---|\n`;
-            for (const f of fails) {
-              const msg = String(f.message || '').replace(/\n/g, ' ').slice(0, 500);
-              body += `| ${f.name} | ${f.methodName} | ${msg} |\n`;
-            }
-
-            await github.rest.issues.createComment({
-              owner, repo, issue_number: pr.number, body
-            });
-
-            // Optionally fail the job if there were failures
-            if (fails.length > 0) {
-              core.setFailed(`Apex tests failed: ${fails.length}`);
-            }
+   
