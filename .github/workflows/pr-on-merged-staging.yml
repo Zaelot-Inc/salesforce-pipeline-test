@@ -132,13 +132,40 @@ jobs:
             --generate-delta \
             --source "force-app/"
 
-          # Check if there are any additive changes (in force-app) or destructive changes.
-          if [ -n "$(ls -A changed-sources/force-app/ || true)" ] || \
-             [ -f "changed-sources/destructiveChanges/destructiveChanges.xml" ] || \
-             [ -f "changed-sources/destructiveChangesPost/destructiveChanges.xml" ]; then
-            echo "no_changes=false" >> "$GITHUB_OUTPUT"
-          else
+          has_addmods="false"
+          has_deletions="false"
+          
+          [ -d changed-sources/force-app ] && [ -n "$(ls -A changed-sources/force-app || true)" ] && has_addmods="true"
+          
+          echo "Checking for destructive changes..."
+
+          if [ -f changed-sources/destructiveChanges/destructiveChanges.xml ]; then
+            echo "Found destructiveChanges.xml, checking for <members>..."
+            if grep -q "<members>" changed-sources/destructiveChanges/destructiveChanges.xml; then
+              echo "Found <members> in destructiveChanges.xml."
+              has_deletions="true"
+            else
+              echo "File is empty or contains no <members>."
+            fi
+          fi
+          
+          if [ -f changed-sources/destructiveChangesPost/destructiveChanges.xml ]; then
+            echo "Found destructiveChangesPost.xml, checking for <members>..."
+            if grep -q "<members>" changed-sources/destructiveChangesPost/destructiveChanges.xml; then
+              echo "Found <members> in destructiveChangesPost.xml."
+              has_deletions="true"
+            else
+              echo "File is empty or contains no <members>."
+            fi
+          fi
+
+          echo "has_addmods=${has_addmods}"     >> "$GITHUB_OUTPUT"
+          echo "has_deletions=${has_deletions}" >> "$GITHUB_OUTPUT"
+
+          if [ "${has_addmods}" != "true" ] && [ "${has_deletions}" != "true" ]; then
             echo "no_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no_changes=false" >> "$GITHUB_OUTPUT"
           fi
 
       # Step 7: If the delta is empty, abort the workflow gracefully.
@@ -216,72 +243,16 @@ jobs:
             EOF
           fi
 
-          # 2) Destructive manifest (merged pre+post if present): {branch}Package-destructive.xml
+          # 2) Destructive manifest (if necessary)
           PRE_XML="changed-sources/destructiveChanges/destructiveChanges.xml"
           POST_XML="changed-sources/destructiveChangesPost/destructiveChanges.xml"
-          if [ -f "$PRE_XML" ] || [ -f "$POST_XML" ]; then
+          if [ "${{ steps.gen_delta.outputs.has_deletions }}" = "true" ]; then
             DEST_PATH="manifest/branches/${BRANCH_SAFE}Package-destructive.xml"
+            echo "Found destructive members, generating merged destructive manifest..."
             export DEST_PATH
-            # Merge both destructive manifests into a single audit file
-            python3 - <<'PY'
-            import os, json
-            from xml.etree import ElementTree as ET
-
-            def read_api_ver():
-                try:
-                    with open("sfdx-project.json","r") as f:
-                        data = json.load(f)
-                        v = data.get("sourceApiVersion")
-                        return str(v) if v else "60.0"
-                except Exception:
-                    return "60.0"
-
-            NS = {"m":"http://soap.sforce.com/2006/04/metadata"}
-            def collect(path):
-                items = {}
-                if not os.path.isfile(path): return items
-                try:
-                    root = ET.parse(path).getroot()
-                    for t in root.findall("m:types", NS):
-                        name = (t.find("m:name", NS).text or "").strip()
-                        if not name: continue
-                        items.setdefault(name, set())
-                        for mem in t.findall("m:members", NS):
-                            m = (mem.text or "").strip()
-                            if m: items[name].add(m)
-                except Exception:
-                    pass
-                return items
-
-            merged = {}
-            for p in [ "changed-sources/destructiveChanges/destructiveChanges.xml",
-                      "changed-sources/destructiveChangesPost/destructiveChanges.xml" ]:
-                sub = collect(p)
-                for k,v in sub.items():
-                    merged.setdefault(k, set()).update(v)
-
-            api_ver = read_api_ver()
-            pkg = ET.Element("Package", xmlns=NS["m"])
-            for tname in sorted(merged.keys()):
-                t = ET.SubElement(pkg, "types")
-                for m in sorted(merged[tname]):
-                    ET.SubElement(t, "members").text = m
-                ET.SubElement(t, "name").text = tname
-            ET.SubElement(pkg, "version").text = api_ver
-
-            xml = ET.tostring(pkg, encoding="utf-8")
-            # Pretty-print if available
-            try:
-                from xml.dom import minidom
-                xml = minidom.parseString(xml).toprettyxml(indent="  ", encoding="utf-8")
-            except Exception:
-                pass
-
-            dest = os.environ.get("DEST_PATH","manifest/branches/branchPackage-destructive.xml")
-            with open(dest, "wb") as f:
-                f.write(xml if isinstance(xml, bytes) else xml.encode("utf-8"))
-            PY
+            python3 .github/scripts/merge_destructive.py
           fi
+
 
           # -------- C) Stage only metadata + the new manifests (avoid changed-sources/) --------
           git add -A -- "force-app" "manifest/branches"
@@ -376,3 +347,19 @@ jobs:
           RELEASE_PR_URL=${{ steps.open_pr.outputs.release_pr_url }}
           BODY="✅ Automated release PR created: ${RELEASE_PR_URL}"
           gh pr comment "${PR_NUMBER}" --body "$BODY"
+
+          # Run Code Analyzer on the release branch (reusable)
+  run-code-analyzer:
+    needs: promote-feature-branch
+    uses: ./.github/workflows/code-analyzer.yml
+    with:
+      ref: ${{ needs.promote-feature-branch.outputs.release_branch }}
+
+  # Run the Prod validation workflow (reusable)
+  run-prod-validation:
+    needs: promote-feature-branch
+    uses: ./.github/workflows/new-main-pr.yml
+    with:
+      ref: ${{ needs.promote-feature-branch.outputs.release_branch }}
+      pr_number: ${{ needs.promote-feature-branch.outputs.release_pr_number || '' }}
+      pr_title:  ${{ github.event.pull_request.title || '' }}
