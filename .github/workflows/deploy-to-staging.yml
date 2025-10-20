@@ -60,14 +60,42 @@ jobs:
 
       # Create delta packages for new, modified, or deleted metadata
       - name: Create delta packages for new, modified or deleted metadata
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p changed-sources
+          FROM_SHA="${{ github.event.before }}"
+          TO_SHA="${{ github.sha }}"
+          echo "Delta range: $FROM_SHA -> $TO_SHA"
           sf sgd source delta \
-            --to "HEAD" \
-            --from "HEAD^" \
+            --from "$FROM_SHA" \
+            --to   "$TO_SHA" \
             --output "changed-sources/" \
             --generate-delta \
             --source "force-app/"
+
+          echo "Delta contents:"
+          find changed-sources -maxdepth 3 -type f -print || true
+
+          # has_addmods
+          if [ -d changed-sources/force-app ] && [ -n "$(ls -A changed-sources/force-app || true)" ]; then
+            echo "has_addmods=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_addmods=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # has_deletions ONLY if there are <members> inside the destructive manifests
+          has_del="false"
+          if [ -f changed-sources/destructiveChanges/destructiveChanges.xml ] && \
+            grep -q "<members>" changed-sources/destructiveChanges/destructiveChanges.xml; then
+            has_del="true"
+          fi
+          if [ -f changed-sources/destructiveChangesPost/destructiveChanges.xml ] && \
+            grep -q "<members>" changed-sources/destructiveChangesPost/destructiveChanges.xml; then
+            has_del="true"
+          fi
+          echo "has_deletions=${has_del}" >> "$GITHUB_OUTPUT"
+
 
       # Authenticate to Staging Org (JWT)
       - name: Authenticate to Staging Org

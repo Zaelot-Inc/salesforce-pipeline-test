@@ -4,6 +4,20 @@ on:
   pull_request:
     branches: [ main ]
     types: [ opened, reopened, synchronize, ready_for_review ]
+  workflow_call:
+    inputs:
+      ref:
+        description: "Release branch / SHA to validate"
+        required: true
+        type: string
+      pr_number:
+        description: "Origin PR number (for comments)"
+        required: false
+        type: string
+      pr_title:
+        description: "Origin PR title (for messages)"
+        required: false
+        type: string
 
 permissions:
   contents: write          # we commit manifests into the PR branch (same-repo PRs)
@@ -23,6 +37,19 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          ref: ${{ inputs.ref || github.sha }}
+
+
+    # If invoked via workflow_call, synthesize PR context for downstream steps
+      - name: Set PR context (workflow_call)
+        if: ${{ github.event_name == 'workflow_call' }}
+        shell: bash
+        run: |
+          echo "PR_NUM=${{ inputs.pr_number || '0' }}" >> $GITHUB_ENV
+          echo "PR_TITLE=${{ inputs.pr_title || 'Release validation (workflow_call)' }}" >> $GITHUB_ENV
+          echo "PR_HEAD_REF=${{ inputs.ref }}" >> $GITHUB_ENV
+          echo "PR_HEAD_SHA=${{ inputs.ref }}" >> $GITHUB_ENV
+
 
       # Quick guard: does the PR touch force-app at all?
       - name: Detect force-app changes
@@ -83,14 +110,22 @@ jobs:
           git fetch --no-tags origin main:refs/remotes/origin/main
           git rev-parse --verify refs/remotes/origin/main
 
-          if git fetch --no-tags origin "refs/pull/${PR_NUM}/merge:refs/remotes/origin/pr-${PR_NUM}-merge"; then
-            echo "TO_REF=refs/remotes/origin/pr-${PR_NUM}-merge" >> "$GITHUB_ENV"
-            echo "Using PR merge ref."
+          if [ "${{ github.event_name }}" = "workflow_call" ]; then
+            # Reusable call: TO_REF is exactly what the caller provided
+            TO_REF='${{ inputs.ref }}'
+            echo "Using TO_REF from workflow_call: ${TO_REF}"
           else
-            echo "PR merge ref not available (likely conflicts). Falling back to PR head."
-            git fetch --no-tags origin "refs/pull/${PR_NUM}/head:refs/remotes/origin/pr-${PR_NUM}-head"
-            git rev-parse --verify "refs/remotes/origin/pr-${PR_NUM}-head"
-            echo "TO_REF=refs/remotes/origin/pr-${PR_NUM}-head" >> "$GITHUB_ENV"
+            # PR run: fetch the PR merge ref (fallback to head if no merge ref)
+            PR_NUM='${{ github.event.pull_request.number }}'
+            git fetch --no-tags origin main:refs/remotes/origin/main
+            if git fetch --no-tags origin "refs/pull/${PR_NUM}/merge:refs/remotes/origin/pr-${PR_NUM}-merge"; then
+              TO_REF="refs/remotes/origin/pr-${PR_NUM}-merge"
+              echo "Using PR merge ref."
+            else
+              git fetch --no-tags origin "refs/pull/${PR_NUM}/head:refs/remotes/origin/pr-${PR_NUM}-head"
+              TO_REF="refs/remotes/origin/pr-${PR_NUM}-head"
+              echo "PR not mergeable; using head ref."
+            fi
           fi
 
       - name: Generate delta (origin/main -> $TO_REF)
@@ -113,11 +148,6 @@ jobs:
           
           [ -d changed-sources/force-app ] && [ -n "$(ls -A changed-sources/force-app || true)" ] && has_addmods="true"
           
-          # --- FIXED LOGIC (set -e safe) ---
-          # We must use nested 'if' statements.
-          # 'set -e' will kill the script if 'grep' returns 1 (not found)
-          # when it's part of a '&&' chain.
-
           echo "Checking for destructive changes..."
 
           if [ -f changed-sources/destructiveChanges/destructiveChanges.xml ]; then
@@ -139,7 +169,6 @@ jobs:
               echo "File is empty or contains no <members>."
             fi
           fi
-          # --- END FIX ---
 
           echo "has_addmods=${has_addmods}"     >> "$GITHUB_OUTPUT"
           echo "has_deletions=${has_deletions}" >> "$GITHUB_OUTPUT"

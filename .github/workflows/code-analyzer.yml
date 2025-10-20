@@ -3,6 +3,12 @@ on:
   pull_request:
     branches: [ staging, main]
     types: [opened, synchronize, ready_for_review]
+  workflow_call:
+    inputs:
+      ref:
+        description: "Branch or SHA to analyze"
+        required: true
+        type: string
 
 jobs: 
   salesforce-code-analyzer-workflow:
@@ -15,10 +21,10 @@ jobs:
 
     steps:
       - name: Check out files
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
-          # Needed so we can diff against the PR base
           fetch-depth: 0
+          ref: ${{ inputs.ref || github.ref }}
       # 1) Collect changed files in the PR
       - uses: actions/github-script@v7
         id: changed
