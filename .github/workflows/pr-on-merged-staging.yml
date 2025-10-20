@@ -413,6 +413,9 @@ jobs:
   run-prod-validation:
     needs: promote-feature-branch
     uses: ./.github/workflows/new-main-pr.yml
+    permissions:
+      contents: write          # we commit manifests into the PR branch (same-repo PRs)
+      pull-requests: write
     with:
       ref: '${{ needs.promote-feature-branch.outputs.release_branch }}'
       pr_number: '${{ needs.promote-feature-branch.outputs.release_pr_number || '''' }}'
@@ -420,5 +423,9 @@ jobs:
   run-code-analyzer:
     needs: promote-feature-branch
     uses: ./.github/workflows/code-analyzer.yml
+    permissions:
+      pull-requests: write
+      contents: read
+      actions: read
     with:
       ref: '${{ needs.promote-feature-branch.outputs.release_branch }}'
