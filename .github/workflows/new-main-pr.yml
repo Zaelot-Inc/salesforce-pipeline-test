@@ -151,51 +151,58 @@ jobs:
           echo "to_ref=${TO_REF}" >> "$GITHUB_OUTPUT"
 
 
-      - name: Generate delta (origin/main -> $TO_REF)
-        if: steps.touched.outputs.has_force_app == 'true'
-        id: delta
+      - name: Generate delta (origin/main → PR merge or inputs.ref)
+        id: gen_delta
         shell: bash
+        env:
+          IS_WF_CALL: ${{ github.event_name == 'workflow_call' }}
+          INPUT_REF: ${{ inputs.ref }}                               # only set in workflow_call
+          PR_NUM:     ${{ github.event.pull_request.number }}        # only set on pull_request
         run: |
-          set -eo pipefail
+          set -euo pipefail
+
+          # Base ref (make sure it's fetched)
+          git fetch --no-tags origin main:refs/remotes/origin/main
+
+          if [ "${IS_WF_CALL}" = "true" ]; then
+            # Reusable workflow path: caller told us exactly what to validate
+            TO_REF="${INPUT_REF}"
+            echo "Using TO_REF from workflow_call: ${TO_REF}"
+          else
+            # PR path: use the test-merge ref if available; else head
+            if git fetch --no-tags origin "refs/pull/${PR_NUM}/merge:refs/remotes/origin/pr-${PR_NUM}-merge"; then
+              TO_REF="refs/remotes/origin/pr-${PR_NUM}-merge"
+              echo "Using PR merge ref."
+            else
+              git fetch --no-tags origin "refs/pull/${PR_NUM}/head:refs/remotes/origin/pr-${PR_NUM}-head"
+              TO_REF="refs/remotes/origin/pr-${PR_NUM}-head"
+              echo "PR not mergeable; using head ref."
+            fi
+          fi
+
           rm -rf changed-sources
           mkdir -p changed-sources
-          TO_REF="${TO_REF:-${{ steps.prepare_ref.outputs.to_ref || '' }}}"
-          TO_REF="${TO_REF:-${{ steps.prepare_ref.outputs.to_ref || '${{ github.sha }}' }}}"
-          echo "Delta: origin/main -> ${TO_REF}"
+
           sf sgd source delta \
             --from "origin/main" \
             --to   "${TO_REF}" \
             --output "changed-sources" \
             --generate-delta \
-            --source "force-app/" || true
+            --source "force-app/"
 
-          has_addmods="false"
-          has_deletions="false"
-          if [ -d changed-sources/force-app ] && [ -n "$(ls -A changed-sources/force-app 2>/dev/null || true)" ]; then
-            has_addmods="true"
-          fi
+          echo "Delta contents:"
+          find changed-sources -maxdepth 4 -type f -print || true
 
-          echo "Checking for destructive changes..."
-          if [ -f changed-sources/destructiveChanges/destructiveChanges.xml ]; then
-            if grep -q "<members>" changed-sources/destructiveChanges/destructiveChanges.xml 2>/dev/null; then
-              has_deletions="true"
-            fi
-          fi
-
-          if [ -f changed-sources/destructiveChangesPost/destructiveChanges.xml ]; then
-            if grep -q "<members>" changed-sources/destructiveChangesPost/destructiveChanges.xml 2>/dev/null; then
-              has_deletions="true"
-            fi
-          fi
-
-          echo "has_addmods=${has_addmods}"     >> "$GITHUB_OUTPUT"
-          echo "has_deletions=${has_deletions}" >> "$GITHUB_OUTPUT"
-
-          if [ "${has_addmods}" != "true" ] && [ "${has_deletions}" != "true" ]; then
-            echo "no_changes=true" >> "$GITHUB_OUTPUT"
+          # Outputs
+          if [ -d changed-sources/force-app ] && find changed-sources/force-app -type f -print -quit | grep -q .; then
+            echo "has_addmods=true" >> "$GITHUB_OUTPUT"
           else
-            echo "no_changes=false" >> "$GITHUB_OUTPUT"
+            echo "has_addmods=false" >> "$GITHUB_OUTPUT"
           fi
+          has_del=false
+          if [ -f changed-sources/destructiveChanges/destructiveChanges.xml ] && grep -q "<members>" changed-sources/destructiveChanges/destructiveChanges.xml; then has_del=true; fi
+          if [ -f changed-sources/destructiveChangesPost/destructiveChanges.xml ] && grep -q "<members>" changed-sources/destructiveChangesPost/destructiveChanges.xml; then has_del=true; fi
+          echo "has_deletions=${has_del}" >> "$GITHUB_OUTPUT"
 
 
       - name: Early exit if no metadata changes
