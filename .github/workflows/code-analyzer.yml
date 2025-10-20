@@ -30,7 +30,6 @@ jobs:
         id: changed
         with:
           script: |
-            const core = require('@actions/core');
             const pr = context.payload.pull_request;
 
             // If this run is a PR run, collect changed files from the PR.
