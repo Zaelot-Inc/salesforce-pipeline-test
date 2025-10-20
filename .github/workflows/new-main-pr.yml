@@ -97,7 +97,7 @@ jobs:
           distribution: 'zulu'
 
       # Prefer the "PR merge" ref (what will land); fallback to PR head if merge ref isn't available.
-            - name: Prepare refs (origin/main + PR merge, with fallback to head)
+      - name: Prepare refs (origin/main + PR merge, with fallback to head)
         if: steps.touched.outputs.has_force_app == 'true'
         shell: bash
         env:
