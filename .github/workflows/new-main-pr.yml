@@ -97,7 +97,7 @@ jobs:
           distribution: 'zulu'
 
       # Prefer the "PR merge" ref (what will land); fallback to PR head if merge ref isn't available.
-      - name: Prepare refs (origin/main + PR merge, with fallback to head)
+            - name: Prepare refs (origin/main + PR merge, with fallback to head)
         if: steps.touched.outputs.has_force_app == 'true'
         shell: bash
         env:
@@ -105,68 +105,86 @@ jobs:
           GH_REPO:  ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
+          set -eo pipefail
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git"
-          git fetch --no-tags origin main:refs/remotes/origin/main
-          git rev-parse --verify refs/remotes/origin/main
+          git fetch --no-tags origin main:refs/remotes/origin/main || true
+          git rev-parse --verify refs/remotes/origin/main >/dev/null 2>&1 || true
 
           if [ "${{ github.event_name }}" = "workflow_call" ]; then
-            # Reusable call: TO_REF is exactly what the caller provided
             TO_REF='${{ inputs.ref }}'
             echo "Using TO_REF from workflow_call: ${TO_REF}"
+            echo "to_ref=${TO_REF}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PR_NUM='${{ github.event.pull_request.number }}'
+          # Try to fetch the merge ref, but do not fail the step if absent
+          if git fetch --no-tags origin "refs/pull/${PR_NUM}/merge:refs/remotes/origin/pr-${PR_NUM}-merge" 2>/dev/null; then
+            TO_REF="refs/remotes/origin/pr-${PR_NUM}-merge"
+            echo "Using PR merge ref."
           else
-            # PR run: fetch the PR merge ref (fallback to head if no merge ref)
-            PR_NUM='${{ github.event.pull_request.number }}'
-            git fetch --no-tags origin main:refs/remotes/origin/main
-            if git fetch --no-tags origin "refs/pull/${PR_NUM}/merge:refs/remotes/origin/pr-${PR_NUM}-merge"; then
-              TO_REF="refs/remotes/origin/pr-${PR_NUM}-merge"
-              echo "Using PR merge ref."
+            # Fallback: fetch head from PR's repo (supports forks)
+            OWNER='${{ github.event.pull_request.head.repo.owner.login }}'
+            REPONAME='${{ github.event.pull_request.head.repo.name }}'
+            BRANCH='${{ github.event.pull_request.head.ref }}'
+            if [ "${OWNER}/${REPONAME}" != "${GH_REPO}" ]; then
+              git remote remove fork 2>/dev/null || true
+              git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${REPONAME}.git"
+              if git fetch --no-tags fork "refs/heads/${BRANCH}:refs/remotes/fork/${BRANCH}" 2>/dev/null; then
+                TO_REF="refs/remotes/fork/${BRANCH}"
+                echo "Fetched feature branch from fork remote."
+              else
+                TO_REF="${{ github.event.pull_request.head.sha }}"
+                echo "Fallback to PR head SHA."
+              fi
             else
-              git fetch --no-tags origin "refs/pull/${PR_NUM}/head:refs/remotes/origin/pr-${PR_NUM}-head"
-              TO_REF="refs/remotes/origin/pr-${PR_NUM}-head"
-              echo "PR not mergeable; using head ref."
+              if git fetch --no-tags origin "refs/pull/${PR_NUM}/head:refs/remotes/origin/pr-${PR_NUM}-head" 2>/dev/null; then
+                TO_REF="refs/remotes/origin/pr-${PR_NUM}-head"
+                echo "Using PR head ref from origin."
+              else
+                TO_REF="${{ github.event.pull_request.head.sha }}"
+                echo "Fallback to PR head SHA."
+              fi
             fi
           fi
 
-      - name: Generate delta (origin/main -> $TO_REF)
+          echo "to_ref=${TO_REF}" >> "$GITHUB_OUTPUT"
+
+
+            - name: Generate delta (origin/main -> $TO_REF)
         if: steps.touched.outputs.has_force_app == 'true'
         id: delta
         shell: bash
         run: |
-          set -euo pipefail # This 'set -e' is the source of the problem
+          set -eo pipefail
           rm -rf changed-sources
           mkdir -p changed-sources
+          TO_REF="${TO_REF:-${{ steps.prepare_ref.outputs.to_ref || '' }}}"
+          TO_REF="${TO_REF:-${{ steps.prepare_ref.outputs.to_ref || '${{ github.sha }}' }}}"
+          echo "Delta: origin/main -> ${TO_REF}"
           sf sgd source delta \
             --from "origin/main" \
             --to   "${TO_REF}" \
             --output "changed-sources" \
             --generate-delta \
-            --source "force-app/"
+            --source "force-app/" || true
 
           has_addmods="false"
           has_deletions="false"
-          
-          [ -d changed-sources/force-app ] && [ -n "$(ls -A changed-sources/force-app || true)" ] && has_addmods="true"
-          
-          echo "Checking for destructive changes..."
+          if [ -d changed-sources/force-app ] && [ -n "$(ls -A changed-sources/force-app 2>/dev/null || true)" ]; then
+            has_addmods="true"
+          fi
 
+          echo "Checking for destructive changes..."
           if [ -f changed-sources/destructiveChanges/destructiveChanges.xml ]; then
-            echo "Found destructiveChanges.xml, checking for <members>..."
-            if grep -q "<members>" changed-sources/destructiveChanges/destructiveChanges.xml; then
-              echo "Found <members> in destructiveChanges.xml."
+            if grep -q "<members>" changed-sources/destructiveChanges/destructiveChanges.xml 2>/dev/null; then
               has_deletions="true"
-            else
-              echo "File is empty or contains no <members>."
             fi
           fi
-          
+
           if [ -f changed-sources/destructiveChangesPost/destructiveChanges.xml ]; then
-            echo "Found destructiveChangesPost.xml, checking for <members>..."
-            if grep -q "<members>" changed-sources/destructiveChangesPost/destructiveChanges.xml; then
-              echo "Found <members> in destructiveChangesPost.xml."
+            if grep -q "<members>" changed-sources/destructiveChangesPost/destructiveChanges.xml 2>/dev/null; then
               has_deletions="true"
-            else
-              echo "File is empty or contains no <members>."
             fi
           fi
 
@@ -178,6 +196,7 @@ jobs:
           else
             echo "no_changes=false" >> "$GITHUB_OUTPUT"
           fi
+
 
       - name: Early exit if no metadata changes
         if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes == 'true'

@@ -55,8 +55,14 @@ jobs:
         env:
           SF_AUTH_KEY: ${{ secrets.SF_JWT_KEY }}
         run: |
+          set -eo pipefail
+          if [ -z "${SF_AUTH_KEY:-}" ]; then
+            echo "SF_JWT_KEY is empty; skipping JWT file creation."
+            exit 0
+          fi
           umask 177
           printf "%s" "$SF_AUTH_KEY" > ./SFDX_INTEGRATION_JWT.key
+          ls -l ./SFDX_INTEGRATION_JWT.key
 
       # Create delta packages for new, modified, or deleted metadata
       - name: Create delta packages for new, modified or deleted metadata
@@ -149,6 +155,17 @@ jobs:
         if: ${{ hashFiles('changed-sources/destructiveChanges/destructiveChanges.xml') != '' }}
         shell: bash
         run: |
+          set -eo pipefail
+          if [ ! -f changed-sources/destructiveChanges/destructiveChanges.xml ]; then
+            echo "No destructiveChanges.xml found; skipping."
+            exit 0
+          fi
+          # Only proceed if file contains members
+          if ! grep -q "<members>" changed-sources/destructiveChanges/destructiveChanges.xml 2>/dev/null; then
+            echo "destructiveChanges.xml contains no <members>; skipping destructive deploy."
+            exit 0
+          fi
+
           echo "Found destructive changes. Deploying..."
           sf project deploy start \
             --metadata-dir "changed-sources/destructiveChanges" \

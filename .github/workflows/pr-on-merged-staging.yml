@@ -89,12 +89,12 @@ jobs:
           git rev-parse --verify origin/main
 
       # Step 5: Fetch the head of the feature branch, including support for PRs from forks.
-      - name: Fetch feature branch (supports forks)
+            - name: Fetch feature branch (supports forks)
         id: fetch_feature
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
+          set -eo pipefail
           OWNER="${PR_HEAD_OWNER}"
           REPONAME="${PR_HEAD_REPO}"
           BRANCH="${PR_HEAD_REF}"
@@ -102,19 +102,27 @@ jobs:
           echo "Fetching '${BRANCH}' from ${OWNER}/${REPONAME} ..."
 
           if [ "${OWNER}/${REPONAME}" = "${{ github.repository }}" ]; then
-            git fetch origin "refs/pull/${PR_NUM}/head:refs/remotes/pr/${BRANCH}"
+            if git fetch origin "refs/pull/${PR_NUM}/head:refs/remotes/pr/${BRANCH}" 2>/dev/null; then
+              echo "FETCH_REF=refs/remotes/pr/${BRANCH}" >> $GITHUB_ENV
+            elif git fetch origin "${BRANCH}:refs/remotes/pr/${BRANCH}" 2>/dev/null; then
+              echo "FETCH_REF=refs/remotes/pr/${BRANCH}" >> $GITHUB_ENV
+            else
+              echo "Could not fetch feature branch by ref from origin; falling back to PR head SHA ${PR_HEAD_SHA}"
+              echo "FETCH_REF=${PR_HEAD_SHA}" >> $GITHUB_ENV
+            fi
           else
             git remote remove fork 2>/dev/null || true
             git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${REPONAME}.git"
-            git fetch origin "refs/pull/${PR_NUM}/head:refs/remotes/pr/${BRANCH}"
+            if git fetch fork "${BRANCH}:refs/remotes/pr/${BRANCH}" 2>/dev/null; then
+              echo "FETCH_REF=refs/remotes/pr/${BRANCH}" >> $GITHUB_ENV
+            else
+              echo "Could not fetch from fork by branch; falling back to PR head SHA ${PR_HEAD_SHA}"
+              echo "FETCH_REF=${PR_HEAD_SHA}" >> $GITHUB_ENV
+            fi
           fi
 
-          if git show-ref --verify --quiet "refs/remotes/pr/${BRANCH}"; then
-            echo "FETCH_REF=refs/remotes/pr/${BRANCH}" >> $GITHUB_ENV
-          else
-            echo "Could not fetch branch by ref; falling back to PR head SHA ${PR_HEAD_SHA}"
-            echo "FETCH_REF=${PR_HEAD_SHA}" >> $GITHUB_ENV
-          fi
+          echo "Fetch reference: ${FETCH_REF:-(not set)}"
+
 
       # Step 6: Generate the delta package using sfdx-git-delta.
       # This compares 'main' to the feature branch head to find all changed, added, and deleted files.
