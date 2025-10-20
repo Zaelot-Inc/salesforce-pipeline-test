@@ -1,24 +1,33 @@
-# Unique name for this workflow
 name: Deploy integration branch to integration and staging/uat orgs
 
 on:
-    push:
-      branches: [ staging ]
-      paths:
-        - 'force-app/**'
-            
+  push:
+    branches: [ staging ]
+    paths:
+      - 'force-app/**'
 
-# Jobs to be executed
+concurrency:
+  group: staging-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   deploy-branch-to-staging-org:
     runs-on: ubuntu-latest
     if: ${{ github.actor != 'dependabot[bot]' }}
+    env:
+      # toggle destructive behavior in staging
+      STAGING_DESTRUCTIVE_CHECK_ONLY: "false"   # or "true"
+      SF_LOGIN_URL: https://test.salesforce.com # replace with My Domain if you have one
     steps:
       - name: Ensure node v20.9.0 or greater
         uses: actions/setup-node@v4
         with:
           node-version: '>=20.9.0'
-          
+
       - name: Ensure java v11 or greater
         uses: actions/setup-java@v4
         with:
@@ -33,23 +42,19 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      # Install Salesforce CLI
       - name: Install Salesforce CLI
         run: npm install -g @salesforce/cli@latest
 
-      # install sfdx-git-delta plugin - https://github.com/scolladon/sfdx-git-delta
-      - name: Installing sfdx git delta
+      - name: Install sfdx-git-delta
         run: |
           echo y | sf plugins install sfdx-git-delta
           sf plugins
 
-      # Checkout the source code
       - name: Checkout source code
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      # Write JWT private key to file (safe)
       - name: Populate auth file with SF_JWT secret of the staging org
         shell: bash
         env:
@@ -58,59 +63,95 @@ jobs:
           umask 177
           printf "%s" "$SF_AUTH_KEY" > ./SFDX_INTEGRATION_JWT.key
 
-      # Create delta packages for new, modified, or deleted metadata
+      # ✅ Use event SHAs so multi-commit pushes are handled correctly
       - name: Create delta packages for new, modified or deleted metadata
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p changed-sources
+          FROM_SHA="${{ github.event.before }}"
+          TO_SHA="${{ github.sha }}"
+          echo "Delta range: $FROM_SHA -> $TO_SHA"
           sf sgd source delta \
-            --to "HEAD" \
-            --from "HEAD^" \
+            --from "$FROM_SHA" \
+            --to   "$TO_SHA" \
             --output "changed-sources/" \
             --generate-delta \
             --source "force-app/"
+          echo "Delta contents:"
+          find changed-sources -maxdepth 3 -type f -print || true
+          # Gate outputs for later steps
+          if [ -d changed-sources/force-app ] && [ -n "$(ls -A changed-sources/force-app || true)" ]; then
+            echo "has_addmods=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_addmods=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -f "changed-sources/destructiveChanges/destructiveChanges.xml" ] || [ -f "changed-sources/destructiveChangesPost/destructiveChanges.xml" ]; then
+            echo "has_deletions=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_deletions=false" >> "$GITHUB_OUTPUT"
+          fi
 
-      # Authenticate to Staging Org (JWT)
-      - name: Authenticate to Staging Org
+      - name: Authenticate to Staging Org (JWT)
         env:
-          SF_AUTH_CLIENT:   ${{ secrets.SF_JWT_CLIENT }}     # Connected App Consumer Key
-          SF_AUTH_USERNAME: ${{ secrets.SF_JWT_USERNAME }}   # Username in target sandbox
+          SF_AUTH_CLIENT:   ${{ secrets.SF_JWT_CLIENT }}
+          SF_AUTH_USERNAME: ${{ secrets.SF_JWT_USERNAME }}
+          SF_LOGIN_URL:     ${{ env.SF_LOGIN_URL }}
         run: |
           sf org login jwt \
             --username "$SF_AUTH_USERNAME" \
             --jwt-key-file ./SFDX_INTEGRATION_JWT.key \
             --client-id "$SF_AUTH_CLIENT" \
-            --instance-url https://test.salesforce.com \
+            --instance-url "$SF_LOGIN_URL" \
             --json --set-default
 
-      # Deploy source to Staging org (SAVE JSON)
-      - name: Deploy to Staging
+      # ➜ Short-circuit with a friendly PR comment when no adds/mods AND no deletions
+      - name: Short-circuit when no delta to deploy
+        if: steps.create_delta.outputs.has_addmods != 'true' && steps.create_delta.outputs.has_deletions != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const sha = context.sha;
+            const resp = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
+            const prs = (resp.data || []).filter(pr => pr.base?.ref === 'staging');
+            if (prs.length) {
+              const pr = prs[0];
+              const body = "ℹ️ Staging deploy skipped: no metadata changes detected in `force-app/**` for this push.";
+              await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
+            }
+          # Exit successfully so required check passes
+      - name: Stop job (no delta)
+        if: steps.create_delta.outputs.has_addmods != 'true' && steps.create_delta.outputs.has_deletions != 'true'
+        run: exit 0
+
+      # Deploy source to Staging org (add/mods)
+      - name: Deploy to Staging (additions/modifications)
+        if: steps.create_delta.outputs.has_addmods == 'true'
+        shell: bash
         run: |
-          echo "Deploying source code to Staging org..."
+          echo "Deploying additions/modifications to Staging..."
           sf project deploy start \
             --source-dir "changed-sources/force-app" \
             --test-level RunLocalTests \
             --wait 120 \
-            --json > staging-deploy.json
-          echo "Wrote staging-deploy.json"
+            --json > staging-deploy.json || true
+          echo "Wrote staging-deploy.json (may include failures)"
 
-      - name: Show Staging Deploy Results
-        if: always() # This makes sure the step runs even if the previous one fails
-        run: |
-          cat staging-deploy.json
-      # Summarize Apex failures -> GitHub Annotations (and fail job)
+      # Summarize Apex failures -> GitHub Annotations (and optionally fail)
       - name: Summarize Apex test failures (annotations)
         if: always()
-        shell: bash
+        shell: bash   # <-- fixed typo
         run: |
           file="staging-deploy.json"
           if [ ! -s "$file" ]; then
-            echo "::warning title=No JSON::staging-deploy.json not found or empty"
+            echo "::notice title=No JSON::staging-deploy.json not found or empty (nothing deployed or previous step skipped)."
             exit 0
           fi
           fails_json=$(jq '.result.details.runTestResult.failures // []' "$file")
           count=$(echo "$fails_json" | jq 'length')
           echo "fail_count=$count" >> $GITHUB_ENV
-          if [[ "$count" -gt 0 ]]; then
+          if [ "$count" -gt 0 ]; then
             echo "Found $count failing tests"
             echo "$fails_json" | jq -r '.[] | "\(.name).\(.methodName)|\(.message)|\(.stackTrace // "")"' | \
             while IFS='|' read -r id msg stack; do
@@ -120,8 +161,19 @@ jobs:
             echo "No Apex test failures 🎉"
           fi
 
-      
-      # Upload JSON artifacts (optional, helps debugging)
+      # Destructive changes (toggle check-only with env)
+      - name: Deploy destructive changes to Staging (if any)
+        if: ${{ steps.create_delta.outputs.has_deletions == 'true' }}
+        shell: bash
+        run: |
+          echo "Found destructive changes. Deploying (check-only=${STAGING_DESTRUCTIVE_CHECK_ONLY})..."
+          args=( --metadata-dir "changed-sources/destructiveChanges" --wait 120 --json )
+          if [ "${STAGING_DESTRUCTIVE_CHECK_ONLY}" = "true" ]; then args+=( --check-only ); fi
+          sf project deploy start "${args[@]}" > staging-destructive.json || true
+          jq -r '.result.id // .result.deploymentId // .id // empty' staging-destructive.json | \
+            awk '{print "destructive_deploy_id="$0}' >> $GITHUB_ENV
+
+      # Upload JSON artifacts (keep for debugging)
       - name: Upload JSON results
         if: always()
         uses: actions/upload-artifact@v4
@@ -129,6 +181,55 @@ jobs:
           name: staging-deploy-json
           path: |
             staging-deploy.json
+            staging-destructive.json
 
+      # Comment PR with results (success or failures)
+      - name: Comment PR with deploy results
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const {owner, repo} = context.repo;
+            const sha = context.sha;
+            const resp = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
+            const prs = (resp.data || []).filter(pr => pr.base?.ref === 'staging');
+            if (!prs.length) {
+              core.info('No associated PR to staging found for this commit; skipping PR comment.');
+              return;
+            }
+            const pr = prs.sort((a,b)=> new Date(b.updated_at) - new Date(a.updated_at))[0];
 
-   
+            let body = `### Staging deploy for \`${sha.slice(0,7)}\`\n`;
+            const ok = fs.existsSync('staging-deploy.json');
+            if (ok) {
+              try {
+                const data = JSON.parse(fs.readFileSync('staging-deploy.json','utf8'));
+                const failures = (((data || {}).result || {}).details || {}).runTestResult?.failures || [];
+                if (failures.length) {
+                  body += `❌ **Apex test failures:** ${failures.length}\n\n| Class | Method | Message |\n|---|---|---|\n`;
+                  for (const f of failures.slice(0,30)) {
+                    const msg = String(f.message || '').replace(/\n/g,' ').slice(0,500);
+                    body += `| ${f.name} | ${f.methodName} | ${msg} |\n`;
+                  }
+                } else {
+                  body += `✅ No Apex test failures reported.\n`;
+                }
+              } catch(e) {
+                body += `⚠️ Could not parse staging-deploy.json: ${e.message}\n`;
+              }
+            } else {
+              body += `ℹ️ No deployment JSON produced (likely no metadata to deploy).\n`;
+            }
+            body += `\n[View run logs](${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID})`;
+            await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
+
+      # Fail job if test failures (optional—keep if you want branch protection to block)
+      - name: Fail job on Apex failures
+        if: always()
+        shell: bash
+        run: |
+          if [ "${fail_count:-0}" -gt 0 ]; then
+            echo "Failing due to Apex test failures: ${fail_count}"
+            exit 1
+          fi
