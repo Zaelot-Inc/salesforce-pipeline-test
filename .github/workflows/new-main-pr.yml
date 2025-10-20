@@ -151,7 +151,7 @@ jobs:
           echo "to_ref=${TO_REF}" >> "$GITHUB_OUTPUT"
 
 
-            - name: Generate delta (origin/main -> $TO_REF)
+      - name: Generate delta (origin/main -> $TO_REF)
         if: steps.touched.outputs.has_force_app == 'true'
         id: delta
         shell: bash
