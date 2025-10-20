@@ -193,9 +193,9 @@ jobs:
             API_VER="${API_VER:-60.0}"
             # Use echo to avoid here-doc issues
             echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<Package xmlns=\"http://soap.sforce.com/2006/04/metadata\">
-  <version>${API_VER}</version>
-</Package>" > "$PKG_PATH"
+              <Package xmlns=\"http://soap.sforce.com/2006/04/metadata\">
+                <version>${API_VER}</version>
+              </Package>" > "$PKG_PATH"
           fi
 
           # 2) Destructive manifest (if necessary)
