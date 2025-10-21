@@ -24,7 +24,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: 'main-pr-manifests-${{ github.event.pull_request.number }}'
+  group: main-pr-manifests-${{ github.event.pull_request.number || inputs.ref || github.sha }}
   cancel-in-progress: true
 
 jobs:
@@ -57,6 +57,11 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            // In workflow_call there is no PR payload — let the delta step decide.
+            if (context.eventName === 'workflow_call') {
+              core.setOutput('has_force_app', 'true');
+              return;
+            }
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const number = context.payload.pull_request.number;
@@ -66,6 +71,7 @@ jobs:
             );
             const hasForceApp = files.some(f => f.filename.startsWith('force-app/'));
             core.setOutput('has_force_app', hasForceApp ? 'true' : 'false');
+
 
       # If NO force-app changes at all, exit gracefully
       - name: No force-app changes (success)
@@ -204,9 +210,16 @@ jobs:
           if [ -f changed-sources/destructiveChangesPost/destructiveChanges.xml ] && grep -q "<members>" changed-sources/destructiveChangesPost/destructiveChanges.xml; then has_del=true; fi
           echo "has_deletions=${has_del}" >> "$GITHUB_OUTPUT"
 
+          if [ "${has_del}" = "false" ] && [ "$(sed -n 's/^has_addmods=//p' "$GITHUB_OUTPUT")" != "true" ]; then
+            echo "no_changes=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "no_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+
 
       - name: Early exit if no metadata changes
-        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes == 'true'
+        if: steps.touched.outputs.has_force_app == 'true' && steps.gen_delta.outputs.no_changes == 'true'
         uses: actions/github-script@v7
         with:
           script: |
@@ -218,7 +231,7 @@ jobs:
             });
 
       - name: Build branch-safe name + output paths
-        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
+        if: steps.touched.outputs.has_force_app == 'true' && steps.gen_delta.outputs.no_changes != 'true'
         id: naming
         shell: bash
         run: |
@@ -233,7 +246,7 @@ jobs:
           echo "dest_path=${DEST}"   >> "$GITHUB_OUTPUT"
 
       - name: Create manifest/branch/<branch>-package.xml (adds/mods)
-        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
+        if: steps.touched.outputs.has_force_app == 'true' && steps.gen_delta.outputs.no_changes != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -252,7 +265,7 @@ jobs:
           fi
 
       - name: Create manifest/branch/<branch>-package-destructive.xml (if deletions)
-        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.has_deletions == 'true'
+        if: steps.touched.outputs.has_force_app == 'true' && steps.gen_delta.outputs.has_deletions == 'true'
         shell: bash
         env:
           # This correctly passes the variable TO the Python script
@@ -267,7 +280,7 @@ jobs:
           python3 .github/scripts/merge_destructive.py
       - name: Can we push to this PR branch?
         id: canpush
-        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
+        if: steps.touched.outputs.has_force_app == 'true' && steps.gen_delta.outputs.no_changes != 'true'
         uses: actions/github-script@v7
         with:
           script: |
@@ -275,7 +288,7 @@ jobs:
             core.setOutput('same_repo', sameRepo ? 'true' : 'false');
 
       - name: Commit manifests into the PR branch
-        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true' && steps.canpush.outputs.same_repo == 'true'
+        if: steps.touched.outputs.has_force_app == 'true' && steps.gen_delta.outputs.no_changes != 'true' && steps.canpush.outputs.same_repo == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -292,7 +305,7 @@ jobs:
           git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
 
       - name: Upload manifests as artifact (fork PRs / no push)
-        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true' && steps.canpush.outputs.same_repo != 'true'
+        if: steps.touched.outputs.has_force_app == 'true' && steps.gen_delta.outputs.no_changes != 'true' && steps.canpush.outputs.same_repo != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: pr-${{ github.event.pull_request.number }}-manifests
@@ -300,7 +313,7 @@ jobs:
             ${{ steps.naming.outputs.pkg_path }}
             ${{ steps.naming.outputs.dest_path }}
       - name: Comment instructions on the PR
-        if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
+        if: steps.touched.outputs.has_force_app == 'true' && steps.gen_delta.outputs.no_changes != 'true'
         uses: actions/github-script@v7
         with:
           script: |
@@ -312,7 +325,7 @@ jobs:
             const branch = "${{ steps.naming.outputs.branch_safe }}";
             const pkg = "${{ steps.naming.outputs.pkg_path }}";
             const dest = "${{ steps.naming.outputs.dest_path }}";
-            const hasDel = "${{ steps.delta.outputs.has_deletions }}" === "true";
+            const hasDel = "${{ steps.gen_delta.outputs.has_deletions }}" === "true";
             const canPush = "${{ steps.canpush.outputs.same_repo }}" === "true";
 
             // Read the template file from the repository
