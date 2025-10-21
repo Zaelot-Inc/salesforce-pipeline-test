@@ -137,6 +137,7 @@ jobs:
             fi
           fi
 
+          echo "TO_REF=${TO_REF}" >> "$GITHUB_ENV"
       - name: Debug refs
         run: |
           echo "Using TO_REF=$TO_REF"
