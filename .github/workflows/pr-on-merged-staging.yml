@@ -408,6 +408,13 @@ jobs:
           gh pr comment "${PR_NUMBER}" --body "$BODY"
 
           # Run Code Analyzer on the release branch (reusable)
+  debug-release-output:
+    needs: promote-feature-branch
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "release_branch='${{ needs.promote-feature-branch.outputs.release_branch }}'"
+          echo "release_pr_number='${{ needs.promote-feature-branch.outputs.release_pr_number }}'"
   run-prod-validation:
     needs: promote-feature-branch
     uses: ./.github/workflows/new-main-pr.yml

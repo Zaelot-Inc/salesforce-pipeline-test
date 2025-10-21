@@ -40,6 +40,13 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
 
+      - name: Debug context (event + inputs)
+        run: |
+          echo "event_name=${{ github.event_name }}"
+          echo "inputs.ref=${{ inputs.ref || '' }}"
+          echo "pull_request.number=${{ github.event.pull_request.number || '' }}"
+          echo "github.sha=${{ github.sha }}"
+          echo "github.ref=${{ github.ref }}"
     # If invoked via workflow_call, synthesize PR context for downstream steps
       - name: Set PR context (workflow_call)
         if: ${{ github.event_name == 'workflow_call' }}
