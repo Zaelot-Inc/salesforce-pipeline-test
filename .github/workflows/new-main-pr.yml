@@ -159,6 +159,7 @@ jobs:
 
       - name: Generate delta (origin/main → PR merge or inputs.ref)
         id: gen_delta
+        if: steps.touched.outputs.has_force_app == 'true'
         shell: bash
         env:
           IS_WF_CALL: ${{ github.event_name == 'workflow_call' }}
