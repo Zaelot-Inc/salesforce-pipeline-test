@@ -110,6 +110,8 @@ jobs:
           git fetch --no-tags origin main:refs/remotes/origin/main
           git rev-parse --verify refs/remotes/origin/main
 
+          TO_REF="HEAD"
+
           if [ "${{ github.event_name }}" = "workflow_call" ]; then
             # Reusable call: TO_REF is exactly what the caller provided
             TO_REF='${{ inputs.ref }}'
