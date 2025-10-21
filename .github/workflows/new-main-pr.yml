@@ -268,17 +268,71 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IS_WF:     ${{ github.event_name == 'workflow_call' }}
+          PR_NUM:    ${{ github.event.pull_request.number }}
+          INPUT_REF: ${{ inputs.ref }}  # only populated in workflow_call
         run: |
           set -euo pipefail
+
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config user.name  "github-actions[bot]"
-          git add -A -- "manifest/branch"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+
+          # --- Resolve target branch we will push to ---
+          TARGET_BRANCH=""
+          if [ "${IS_WF}" = "true" ] && [ -n "${INPUT_REF:-}" ]; then
+            # inputs.ref may be 'release/...' or a SHA; we only push to branches
+            case "${INPUT_REF}" in
+              refs/heads/*) TARGET_BRANCH="${INPUT_REF#refs/heads/}";;
+              *)             TARGET_BRANCH="${INPUT_REF}";;
+            esac
+          else
+            TARGET_BRANCH='${{ github.event.pull_request.head.ref }}'
+          fi
+
+          if [ -z "${TARGET_BRANCH}" ]; then
+            echo "::error::Could not determine target branch for manifest commit."
+            exit 1
+          fi
+          echo "Target branch: ${TARGET_BRANCH}"
+
+          # --- Ensure we are based on the latest remote tip of that branch ---
+          git fetch --no-tags origin "${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}" || true
+
+          if git show-ref --verify --quiet "refs/remotes/origin/${TARGET_BRANCH}"; then
+            git checkout -B "${TARGET_BRANCH}" "refs/remotes/origin/${TARGET_BRANCH}"
+          else
+            # If branch doesn't exist yet (rare for PRs), create it off main
+            git fetch --no-tags origin main:refs/remotes/origin/main
+            git checkout -B "${TARGET_BRANCH}" refs/remotes/origin/main
+          fi
+
+          # --- Stage manifest changes ---
+          # Adjust paths to your manifest outputs
+          if [ -d "manifest/branch" ] && find manifest/branch -type f -print -quit | grep -q .; then
+            git add -A manifest/branch
+          fi
           if git diff --cached --quiet; then
-            echo "Manifests unchanged; nothing to commit."
+            echo "No manifest changes to commit."
             exit 0
           fi
-          git commit -m "chore(manifest): generate delta manifests for PR #${{ github.event.pull_request.number }}"
-          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+
+          git commit -m "chore(manifest): update delta manifests for PR #${PR_NUM:-0}"
+
+          # --- Safe push with lease ---
+          # Determine the remote tip we fetched; lease ensures we don't clobber newer commits
+          REMOTE_TIP="$(git rev-parse "refs/remotes/origin/${TARGET_BRANCH}" 2>/dev/null || echo "")"
+          if [ -n "${REMOTE_TIP}" ]; then
+            echo "Remote tip is ${REMOTE_TIP}"
+            if ! git push --force-with-lease=refs/heads/${TARGET_BRANCH}:${REMOTE_TIP} origin "HEAD:${TARGET_BRANCH}"; then
+              echo "::error::Could not push manifests: remote branch '${TARGET_BRANCH}' moved during this run."
+              echo "Resolve by re-running the job (or merge latest into your release branch) and try again."
+              exit 2
+            fi
+          else
+            echo "Remote branch didn't exist; creating it."
+            git push --set-upstream origin "HEAD:${TARGET_BRANCH}"
+          fi
 
       - name: Upload manifests as artifact (fork PRs / no push)
         if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true' && steps.canpush.outputs.same_repo != 'true'
