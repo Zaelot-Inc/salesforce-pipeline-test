@@ -330,6 +330,7 @@ jobs:
               body = removeBlock('IF_DESTRUCTIVE', body);
             }
             
+            
             if (canPush) {
               // It's a same-repo PR, so remove the "fork" message
               body = removeBlock('IF_FORK_PR', body);
