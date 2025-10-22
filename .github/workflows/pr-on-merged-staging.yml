@@ -429,6 +429,10 @@ jobs:
     needs: [promote-feature-branch, guard-and-context]
     if: ${{ needs.guard-and-context.outputs.is_merge }}
     uses: ./.github/workflows/code-analyzer.yml
+    permissions:
+      actions: read
+      pull-requests: write # Grants permission to create a pull request review. Only necessary if running against pull requests.
+      contents: read
     with:
       ref: ${{ needs.promote-feature-branch.outputs.release_branch }}
 
@@ -437,6 +441,9 @@ jobs:
     needs: [promote-feature-branch, guard-and-context]
     if: ${{ needs.guard-and-context.outputs.is_merge }}
     uses: ./.github/workflows/new-main-pr.yml
+    permissions:
+      contents: write          # we commit manifests into the PR branch (same-repo PRs)
+      pull-requests: write
     with:
       ref: '${{ needs.promote-feature-branch.outputs.release_branch }}'
 
