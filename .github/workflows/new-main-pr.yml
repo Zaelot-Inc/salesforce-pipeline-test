@@ -66,7 +66,7 @@ jobs:
         run: |
             set -euo pipefail
             FROM=origin/main
-            TO="${{ steps.refs.outputs.to_ref }}"
+            TO="${{ env.PR_HEAD_REF }}"
             if git diff --name-only --diff-filter=ACDMR "$FROM" "$TO" -- 'force-app/**' | grep -q .; then
               echo "has_force_app=true" >> "$GITHUB_OUTPUT"
             else
@@ -197,6 +197,7 @@ jobs:
               body: "ℹ️ No delta found between `main` and this PR — no manifests generated."
             });
 
+          
       - name: Build branch-safe name + output paths
         if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
         id: naming
@@ -285,7 +286,7 @@ jobs:
             echo "Manifests unchanged; nothing to commit."
             exit 0
           fi
-          git commit -m "chore(manifest): generate delta manifests for PR #:${ process.env.PR_NUM }"
+          git commit -m "chore(manifest): generate delta manifests for PR #:${{ env.PR_NUM }}"
           git push origin "HEAD:${ process.env.PR_HEAD_REF }"
 
       - name: Upload manifests as artifact (fork PRs / no push)
@@ -296,6 +297,8 @@ jobs:
           path: |
             ${{ steps.naming.outputs.pkg_path }}
             ${{ steps.naming.outputs.dest_path }}
+          if-no-files-found: ignore
+
       - name: Comment instructions on the PR
         if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
         uses: actions/github-script@v7
@@ -330,7 +333,7 @@ jobs:
               body = removeBlock('IF_DESTRUCTIVE', body);
             }
             
-            
+
             if (canPush) {
               // It's a same-repo PR, so remove the "fork" message
               body = removeBlock('IF_FORK_PR', body);
