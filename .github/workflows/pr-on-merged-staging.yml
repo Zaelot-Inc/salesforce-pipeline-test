@@ -4,8 +4,7 @@
 name: Build release branch (on PR merged to staging)
 
 on:
-  pull_request:
-    types: [closed]
+  push:
     branches: [staging]
 
 # Ensures only one promotion workflow runs at a time. If another PR is merged
@@ -20,13 +19,43 @@ permissions:
   pull-requests: write
 
 jobs:
+  guard-and-context:
+    name: Resolve PR for this push (must be a merged PR → staging)
+    runs-on: ubuntu-latest
+    outputs:
+      pr_number: ${{ steps.find.outputs.pr_number }}
+      pr_title:  ${{ steps.find.outputs.pr_title }}
+      is_merge:  ${{ steps.find.outputs.is_merge }}
+    steps:
+      - name: Find PR associated with this commit
+        id: find
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const sha = context.sha;
+            const prsResp = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
+            const prs = (prsResp.data || []).filter(pr => pr.base?.ref === 'staging');
+            if (!prs.length) {
+              core.info('No PR associated with this push to staging. Skipping.');
+              core.setOutput('is_merge', 'false');
+              return;
+            }
+            const pr = prs.sort((a,b)=> new Date(b.updated_at) - new Date(a.updated_at))[0];
+            const prFull = await github.rest.pulls.get({ owner, repo, pull_number: pr.number });
+            const merged = !!prFull.data.merged;
+            core.setOutput('pr_number', String(pr.number));
+            core.setOutput('pr_title',  pr.title || '');
+            core.setOutput('is_merge',  merged ? 'true' : 'false');
+            if (!merged) core.info(`PR #${pr.number} is closed but not merged; skipping.`);
   promote-feature-branch:
     name: Promote feature branch -> release branch
-    runs-on: ubuntu-latest
-    if: ${{ github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'staging' }}
+    needs: [guard-and-context]
     env:
       # This is a placeholder for the validation org URL.
       SF_LOGIN_URL_PROD: "https://test.salesforce.com"
+    if: ${{ needs.guard-and-context.outputs.is_merge }}
+    runs-on: ubuntu-latest
     outputs:
       release_branch: ${{ steps.create_branch.outputs.release_branch }}
       release_pr_number: ${{ steps.open_pr.outputs.release_pr_number }}
@@ -350,7 +379,8 @@ jobs:
 
           # Run Code Analyzer on the release branch (reusable)
   run-generate-manifest-on-main:
-    needs: promote-feature-branch
+    needs: [promote-feature-branch, guard-and-context]
+    if: ${{ needs.guard-and-context.outputs.is_merge }}
     uses: ./.github/workflows/new-main-pr.yml
     with:
       ref: '${{ needs.promote-feature-branch.outputs.release_branch }}'
@@ -358,9 +388,9 @@ jobs:
       pr_title: '${{ github.event.pull_request.title || '''' }}'
   code-analyzer-status-pending:
     name: Code Analyzer – mark pending
-    needs: promote-feature-branch
+    needs: [promote-feature-branch, guard-and-context]
+    if: ${{ needs.guard-and-context.outputs.is_merge }} && ${{ needs.promote-feature-branch.outputs.release_pr_number != '' }}
     runs-on: ubuntu-latest
-    if: ${{ needs.promote-feature-branch.outputs.release_pr_number != '' }}
     outputs:
       analysis_sha: ${{ steps.get.outputs.sha }}
       pr_number: ${{ steps.get.outputs.pr }}
@@ -394,13 +424,19 @@ jobs:
           JSON
 
 
+
   run-code-analyzer:
-    needs: [promote-feature-branch, code-analyzer-status-pending]
+    needs: [promote-feature-branch, guard-and-context]
+    if: ${{ needs.guard-and-context.outputs.is_merge }}
     uses: ./.github/workflows/code-analyzer.yml
-    permissions:
-      pull-requests: write
-      contents: read
-      actions: read
+    with:
+      ref: ${{ needs.promote-feature-branch.outputs.release_branch }}
+
+  # Run the Prod validation workflow (reusable)
+  run-prod-validation:
+    needs: [promote-feature-branch, guard-and-context]
+    if: ${{ needs.guard-and-context.outputs.is_merge }}
+    uses: ./.github/workflows/new-main-pr.yml
     with:
       ref: '${{ needs.promote-feature-branch.outputs.release_branch }}'
 
