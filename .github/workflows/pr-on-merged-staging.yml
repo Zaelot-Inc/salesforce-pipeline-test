@@ -349,17 +349,159 @@ jobs:
           gh pr comment "${PR_NUMBER}" --body "$BODY"
 
           # Run Code Analyzer on the release branch (reusable)
-  run-code-analyzer:
-    needs: promote-feature-branch
-    uses: ./.github/workflows/code-analyzer.yml
-    with:
-      ref: ${{ needs.promote-feature-branch.outputs.release_branch }}
-
-  # Run the Prod validation workflow (reusable)
-  run-prod-validation:
+  run-generate-manifest-on-main:
     needs: promote-feature-branch
     uses: ./.github/workflows/new-main-pr.yml
     with:
-      ref: ${{ needs.promote-feature-branch.outputs.release_branch }}
-      pr_number: ${{ needs.promote-feature-branch.outputs.release_pr_number || '' }}
-      pr_title:  ${{ github.event.pull_request.title || '' }}
+      ref: '${{ needs.promote-feature-branch.outputs.release_branch }}'
+      pr_number: '${{ needs.promote-feature-branch.outputs.release_pr_number || '''' }}'
+      pr_title: '${{ github.event.pull_request.title || '''' }}'
+  code-analyzer-status-pending:
+    name: Code Analyzer – mark pending
+    needs: promote-feature-branch
+    runs-on: ubuntu-latest
+    if: ${{ needs.promote-feature-branch.outputs.release_pr_number != '' }}
+    outputs:
+      analysis_sha: ${{ steps.get.outputs.sha }}
+      pr_number: ${{ steps.get.outputs.pr }}
+    steps:
+      - name: Resolve PR + head SHA
+        id: get
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ needs.promote-feature-branch.outputs.release_pr_number }}
+        run: |
+          set -euo pipefail
+          SHA=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "pr=$PR"   >> "$GITHUB_OUTPUT"
+
+      - name: Set commit status pending (code-analyzer)
+        env:
+          SHA: ${{ steps.get.outputs.sha }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${SHA}" \
+            -d @- <<JSON
+          {
+            "state": "pending",
+            "context": "code-analyzer",
+            "description": "Running Salesforce Code Analyzer",
+            "target_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }
+          JSON
+
+
+  run-code-analyzer:
+    needs: [promote-feature-branch, code-analyzer-status-pending]
+    uses: ./.github/workflows/code-analyzer.yml
+    permissions:
+      pull-requests: write
+      contents: read
+      actions: read
+    with:
+      ref: '${{ needs.promote-feature-branch.outputs.release_branch }}'
+
+  code-analyzer-status-final:
+    name: Code Analyzer - finalize
+    needs: [code-analyzer-status-pending, run-code-analyzer]
+    if: ${{ needs.code-analyzer-status-pending.outputs.analysis_sha != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decide final state from reusable job result
+        id: decide
+        run: |
+          RES='${{ needs.run-code-analyzer.result }}'   # success | failure | cancelled
+          if [ "$RES" = "success" ]; then
+            echo "state=success" >> $GITHUB_OUTPUT
+            echo "desc=Code Analyzer passed" >> $GITHUB_OUTPUT
+          else
+            echo "state=failure" >> $GITHUB_OUTPUT
+            echo "desc=Code Analyzer failed (${RES})" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Find analyzer PR comment URL (robust)
+        id: find_comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.code-analyzer-status-pending.outputs.pr_number }}
+          SHA: ${{ needs.code-analyzer-status-pending.outputs.analysis_sha }}
+        run: |
+          set -euo pipefail
+
+          # 1) Find the analyzer workflow run for this SHA (event=workflow_call)
+          RUN_JSON=$(gh api \
+            repos/$REPO/actions/workflows/code-analyzer.yml/runs \
+            -f head_sha="$SHA" -f event=workflow_call \
+            --jq '.workflow_runs | sort_by(.created_at) | last // empty')
+
+          if [ -n "$RUN_JSON" ] && [ "$RUN_JSON" != "null" ]; then
+            RUN_ID=$(jq -r '.id' <<<"$RUN_JSON")
+            RUN_CREATED=$(jq -r '.created_at' <<<"$RUN_JSON")
+            RUN_URL=$(jq -r '.html_url' <<<"$RUN_JSON")
+          else
+            # If we can’t find the run (e.g., different filename), still proceed.
+            RUN_ID=""
+            # Use a conservative "since" cutoff (1 day) to reduce noise.
+            RUN_CREATED=$(date -u -d "1 day ago" +"%Y-%m-%dT%H:%M:%SZ")
+            RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
+
+          # 2) Collect PR issue comments since the run started (most analyzers use issue comments)
+          ISSUE_COMMENTS=$(gh api \
+            repos/$REPO/issues/$PR/comments \
+            -f since="$RUN_CREATED" \
+            --paginate)
+
+          # 3) Collect PR review comments since the run started (some tools use review comments)
+          REVIEW_COMMENTS=$(gh api \
+            repos/$REPO/pulls/$PR/comments \
+            -f since="$RUN_CREATED" \
+            --paginate)
+
+          # 4) Filter to comments authored by the bot, newest last, prefer issue comments
+          BOT="github-actions[bot]"
+          ISSUE_URL=$(jq -r \
+            --arg BOT "$BOT" \
+            '[ .[] | select(.user.login == $BOT) ] | sort_by(.created_at) | last | .html_url // empty' \
+            <<<"$ISSUE_COMMENTS")
+
+          REVIEW_URL=$(jq -r \
+            --arg BOT "$BOT" \
+            '[ .[] | select(.user.login == $BOT) ] | sort_by(.created_at) | last | .html_url // empty' \
+            <<<"$REVIEW_COMMENTS")
+
+          # 5) Pick the best candidate; fall back to the analyzer run page if none
+          if [ -n "$ISSUE_URL" ]; then
+            URL="$ISSUE_URL"
+          elif [ -n "$REVIEW_URL" ]; then
+            URL="$REVIEW_URL"
+          else
+            URL="$RUN_URL"
+          fi
+
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Set commit status success/failure (code-analyzer)
+        env:
+          SHA:   ${{ needs.code-analyzer-status-pending.outputs.analysis_sha }}
+          STATE: ${{ steps.decide.outputs.state }}
+          DESC:  ${{ steps.decide.outputs.desc }}
+          URL:   ${{ steps.find_comment.outputs.url }}
+        run: |
+          TARGET="${URL:-${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}}"
+          curl -s -X POST \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${SHA}" \
+            -d @- <<JSON
+          {
+            "state": "${STATE}",
+            "context": "code-analyzer",
+            "description": "${DESC}",
+            "target_url": "${TARGET}"
+          }
+          JSON
