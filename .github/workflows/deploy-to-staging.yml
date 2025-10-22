@@ -25,7 +25,6 @@ jobs:
         with:
           java-version: '>=11'
           distribution: 'zulu'
-          
 
       - name: Ensure python v3.10 or greater
         uses: actions/setup-python@v5

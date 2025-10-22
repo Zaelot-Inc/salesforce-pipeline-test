@@ -167,21 +167,90 @@ jobs:
             git checkout -B "${RELEASE_BRANCH}" origin/main
           fi
 
-          # 4) Cherry-pick each commit not already in main
-          for sha in "${COMMITS[@]}"; do
-            if git merge-base --is-ancestor "$sha" origin/main; then
-              echo "Skipping $sha (already in main)"; continue
-            fi
-            echo "Cherry-picking $sha"
-            git cherry-pick -x "$sha" || { echo "::error::Conflict on $sha"; git cherry-pick --abort; exit 1; }
-          done
 
-          # 5) Push branch and expose outputs
+          # 4) Push branch and expose outputs
           git push origin "HEAD:${RELEASE_BRANCH}"
           echo "release_branch=${RELEASE_BRANCH}" >> "$GITHUB_OUTPUT"
           echo "pr_number=${PR_NUM}" >> "$GITHUB_OUTPUT"
           echo "pr_title=${PR_TITLE}" >> "$GITHUB_OUTPUT"
 
+      - name: Cherry-pick PR commits (preserve history, handle conflicts)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Ensure we’re on the release branch created in the previous step
+          CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          if [ "$CURRENT_BRANCH" = "HEAD" ]; then
+            echo "::error::No branch checked out before cherry-pick"; exit 1;
+          fi
+          REL_BRANCH="$CURRENT_BRANCH"
+
+          # Pull the commit list again to keep this step self-contained
+          # (the previous step already determined the PR number)
+          PR_JSON_LAST="$(git log -1 --format=%B | sed -n 's/.*Promote PR #\([0-9]\+\).*/\1/p' || true)"
+          if [ -z "$PR_JSON_LAST" ]; then
+            # Fallback: re-discover the PR that was merged into staging for this push
+            HEAD_SHA="${GITHUB_SHA}"
+            PR_JSON="$(gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls" --jq '[.[] | select(.base.ref=="staging")] | sort_by(.updated_at) | last // empty')"
+            [ -z "$PR_JSON" ] || [ "$PR_JSON" = "null" ] && { echo "::error::Could not determine source PR"; exit 1; }
+            PR_NUM="$(jq -r '.number' <<<"$PR_JSON")"
+          else
+            PR_NUM="$PR_JSON_LAST"
+          fi
+
+          mapfile -t COMMITS < <(gh api "repos/${REPO}/pulls/${PR_NUM}/commits" --paginate --jq '.[].sha')
+          if [ "${#COMMITS[@]}" -eq 0 ]; then
+            echo "::error::PR #${PR_NUM} has no commits."; exit 1;
+          fi
+
+          # Helper to post conflicts to the release PR
+          post_conflict_comment () {
+            local PR="$1" BRANCH="$2" FILES="$3" COMMIT="$4"
+            local BODY="❌ **Cherry-pick conflict** while promoting PR #${PR} to \`${BRANCH}\` on commit \`${COMMIT}\`.
+
+          **Conflicted files:**
+          \`\`\`
+          ${FILES}
+          \`\`\`
+
+          Please resolve directly on \`${BRANCH}\` (based on \`main\`) and push the fixes. The workflow will pass after resolution."
+                gh pr comment "${PR}" --repo "${REPO}" --body "$BODY" || true
+              }
+
+              for sha in "${COMMITS[@]}"; do
+            # Skip commits that are already in main
+            if git merge-base --is-ancestor "$sha" origin/main; then
+              echo "Skipping $sha (already in main)"; continue
+            fi
+
+            echo "::group::Cherry-picking $sha"
+            # 1) Try a normal cherry-pick
+            if git cherry-pick -x "$sha"; then
+              echo "Cherry-picked $sha"; echo "::endgroup::"; continue
+            fi
+
+            echo "Conflict on $sha — retry with -Xtheirs (prefer PR change)"
+            # 2) Retry preferring incoming hunks (the PR)
+            git cherry-pick --abort >/dev/null 2>&1 || true
+            if git cherry-pick -x -Xtheirs "$sha"; then
+              echo "Cherry-picked $sha with -Xtheirs"; echo "::endgroup::"; continue
+            fi
+
+            # 3) Still conflicted → report and fail
+            CONFLICTS="$(git diff --name-only --diff-filter=U || true)"
+            git cherry-pick --abort || true
+            echo "::error::Unresolved conflicts on $sha"
+            echo "$CONFLICTS"
+            post_conflict_comment "${PR_NUM}" "${REL_BRANCH}" "${CONFLICTS}" "${sha}"
+            echo "::endgroup::"
+            exit 1
+          done
+
+          # Push the updated release branch
+          git push origin "HEAD:${REL_BRANCH}"
 
       # Step 6: Open PR release → main (idempotent)
       - name: Open PR release → main (idempotent)
