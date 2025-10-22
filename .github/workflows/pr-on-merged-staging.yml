@@ -23,7 +23,8 @@ jobs:
   promote-feature-branch:
     name: Promote feature branch -> release branch
     runs-on: ubuntu-latest
-    if: ${{ github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'staging' }}
+    
+
     env:
       # This is a placeholder for the validation org URL.
       SF_LOGIN_URL_PROD: "https://test.salesforce.com"
