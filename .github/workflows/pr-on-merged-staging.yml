@@ -117,39 +117,23 @@ jobs:
           java-version: '11'
           distribution: zulu
 
-      # Step 3: Fetch main and feature refs
-      - name: Fetch origin/main and prepare refs
+       # Step 3: Fetch main and PR head (ensure all commits are available)
+      - name: Fetch main and PR head (for cherry-pick)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
-          git fetch origin +refs/heads/main:refs/remotes/origin/main
-
-          OWNER="${PR_HEAD_OWNER}"
-          REPONAME="${PR_HEAD_REPO}"
-          BRANCH="${PR_HEAD_REF}"
-          PR_NUM="${PR_NUMBER}"
-
-          echo "Fetching '${BRANCH}' from ${OWNER}/${REPONAME} ..."
-
-          if [ "${OWNER}/${REPONAME}" = "${{ github.repository }}" ]; then
-            git fetch origin "refs/pull/${PR_NUM}/head:refs/remotes/pr/${BRANCH}"
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          OWNER="${PR_HEAD_OWNER}"; REPO="${PR_HEAD_REPO}"; BR="${PR_HEAD_REF}"; PR="${PR_NUMBER}"
+          if [ "${OWNER}/${REPO}" = "${{ github.repository }}" ]; then
+            git fetch --no-tags origin "refs/pull/${PR}/head:refs/remotes/pr/${BR}"
           else
             git remote remove fork 2>/dev/null || true
-            git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${REPONAME}.git"
-            git fetch fork "refs/heads/${BRANCH}:refs/remotes/pr/${BRANCH}" || \
-              git fetch origin "refs/pull/${PR_NUM}/head:refs/remotes/pr/${BRANCH}"
+            git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${REPO}.git"
+            git fetch --no-tags fork "refs/heads/${BR}:refs/remotes/pr/${BR}" || \
+            git fetch --no-tags origin "refs/pull/${PR}/head:refs/remotes/pr/${BR}"
           fi
-
-          if git show-ref --verify --quiet "refs/remotes/pr/${BRANCH}"; then
-            echo "FETCH_REF=refs/remotes/pr/${BRANCH}" >> $GITHUB_ENV
-          else
-            echo "Could not fetch branch by ref; falling back to PR head SHA ${PR_HEAD_SHA}"
-            echo "FETCH_REF=${PR_HEAD_SHA}" >> $GITHUB_ENV
-          fi
-
       # Step 4: Compute delta (AM + D) between main and feature
       - name: Generate delta (adds/mods + deletions) for force-app/**
         id: gen_delta
@@ -209,15 +193,30 @@ jobs:
           BODY="✅ No deployable metadata detected between \`main\` and feature branch \`${PR_HEAD_REF}\` (PR #${PR_NUMBER}). Nothing to promote."
           gh pr comment "${PR_NUMBER}" --body "$BODY"
 
-      # Step 5: Create release branch from main
-      - name: Create release branch from origin/main
-        if: steps.gen_delta.outputs.no_changes == 'false'
-        id: create_branch
+      # Step 5: Cherry-pick PR commits (preserve history)
+      - name: Cherry-pick PR commits (preserve history)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          SHORTSHA=$(echo "${PR_HEAD_SHA}" | cut -c1-7)
-          RELEASE_BRANCH="release/pr-${PR_NUMBER}-${SHORTSHA}"
-          git checkout -b "${RELEASE_BRANCH}" origin/main
+          # Get PR commits (oldest → newest)
+          mapfile -t COMMITS < <(gh api \
+            repos/${{ github.repository }}/pulls/${PR_NUMBER}/commits \
+            --paginate --jq '.[].sha')
+          if [ "${#COMMITS[@]}" -eq 0 ]; then
+            echo "No commits found for PR #${PR_NUMBER}"; exit 1
+          fi
+          git checkout "${RELEASE_BRANCH}"
+          for sha in "${COMMITS[@]}"; do
+            if git merge-base --is-ancestor "$sha" origin/main; then
+              echo "Skip $sha (already in main)"
+              continue
+            fi
+            echo "Cherry-pick $sha"
+            git cherry-pick -x "$sha" || { echo "::error::Conflict on $sha"; git cherry-pick --abort; exit 1; }
+          done
+          git push origin "HEAD:${RELEASE_BRANCH}"
+
           echo "RELEASE_BRANCH=${RELEASE_BRANCH}" >> $GITHUB_ENV
           echo "release_branch=${RELEASE_BRANCH}" >> $GITHUB_OUTPUT
 
