@@ -125,24 +125,38 @@ jobs:
         run: |
           set -euo pipefail
           REPO="${{ github.repository }}"
+
+          # Auth + fetch main
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
 
+          # 1) Find the PR into 'staging' associated with this push's head commit
           HEAD_SHA="${GITHUB_SHA}"
-          PR_JSON="$(gh api repos/${REPO}/commits/${HEAD_SHA}/pulls --jq '[.[] | select(.base.ref==\"staging\" && .merged==true)] | sort_by(.updated_at) | last // empty')"
+          PR_JSON="$(gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls" \
+            --jq '[.[] | select(.base.ref=="staging")] | sort_by(.updated_at) | last // empty')"
           if [ -z "${PR_JSON}" ] || [ "${PR_JSON}" = "null" ]; then
-            echo "::error::No merged PR into 'staging' for ${HEAD_SHA}."; exit 1;
+            echo "::error::No PR into 'staging' associated with ${HEAD_SHA}."; exit 1;
           fi
           PR_NUM="$(jq -r '.number' <<<"$PR_JSON")"
-          PR_TITLE="$(jq -r '.title // \"\"' <<<"$PR_JSON")"
 
-          mapfile -t COMMITS < <(gh api repos/${REPO}/pulls/${PR_NUM}/commits --paginate --jq '.[].sha')
+          # Verify it was merged
+          IS_MERGED="$(gh api "repos/${REPO}/pulls/${PR_NUM}" --jq '.merged')"
+          if [ "${IS_MERGED}" != "true" ]; then
+            echo "::error::PR #${PR_NUM} is not merged into 'staging'."; exit 1;
+          fi
+          PR_TITLE="$(jq -r '.title // ""' <<<"$PR_JSON")"
+
+          echo "Using merged PR #${PR_NUM} → staging"
+
+          # 2) All PR commits (oldest → newest)
+          mapfile -t COMMITS < <(gh api "repos/${REPO}/pulls/${PR_NUM}/commits" --paginate --jq '.[].sha')
           if [ "${#COMMITS[@]}" -eq 0 ]; then
             echo "::error::PR #${PR_NUM} has no commits."; exit 1;
           fi
           FIRST_SHORT="$(echo "${COMMITS[0]}" | cut -c1-7)"
           LAST_SHORT="$(echo "${COMMITS[-1]}" | cut -c1-7)"
 
+          # 3) Create/reuse deterministic release branch from main
           RELEASE_BRANCH="release/pr-${PR_NUM}-${FIRST_SHORT}-${LAST_SHORT}"
           if git show-ref --verify --quiet "refs/heads/${RELEASE_BRANCH}"; then
             git checkout "${RELEASE_BRANCH}"
@@ -153,15 +167,16 @@ jobs:
             git checkout -B "${RELEASE_BRANCH}" origin/main
           fi
 
+          # 4) Cherry-pick each commit not already in main
           for sha in "${COMMITS[@]}"; do
             if git merge-base --is-ancestor "$sha" origin/main; then
-              echo "Skipping $sha (already in main)"
-              continue
+              echo "Skipping $sha (already in main)"; continue
             fi
             echo "Cherry-picking $sha"
             git cherry-pick -x "$sha" || { echo "::error::Conflict on $sha"; git cherry-pick --abort; exit 1; }
           done
 
+          # 5) Push branch and expose outputs
           git push origin "HEAD:${RELEASE_BRANCH}"
           echo "release_branch=${RELEASE_BRANCH}" >> "$GITHUB_OUTPUT"
           echo "pr_number=${PR_NUM}" >> "$GITHUB_OUTPUT"

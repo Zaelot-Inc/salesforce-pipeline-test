@@ -134,6 +134,7 @@ jobs:
             fi
           fi
 
+          
       - name: Generate delta (origin/main -> $TO_REF)
         if: steps.touched.outputs.has_force_app == 'true'
         id: delta
