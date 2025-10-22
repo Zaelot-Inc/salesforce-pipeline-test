@@ -416,7 +416,7 @@ jobs:
       ref: ${{ needs.promote-feature-branch.outputs.release_branch }}
 
   # Optionally run your manifest/validation reusable workflow after creating PR
-  run-prod-validation:
+  run-new-pr-to-main:
     needs: [promote-feature-branch, guard-and-context]
     if: ${{ needs.guard-and-context.outputs.is_merge == 'true' }}
     uses: ./.github/workflows/new-main-pr.yml
