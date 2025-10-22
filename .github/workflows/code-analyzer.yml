@@ -19,8 +19,6 @@ jobs:
       actions: read # Grants permission to read the in-progress actions. Only necessary for private repos.
     runs-on: ubuntu-latest
     steps:
-
-      
       - name: Check out files
         uses: actions/checkout@v5
         with:

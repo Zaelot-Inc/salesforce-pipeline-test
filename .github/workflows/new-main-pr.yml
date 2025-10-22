@@ -1,6 +1,4 @@
 name: Generate deploy manifests + PR instructions (no auto validation)
-
-
 on:
   pull_request:
     branches: [ main ]
