@@ -26,6 +26,10 @@ jobs:
       pr_number: ${{ steps.find.outputs.pr_number }}
       pr_title:  ${{ steps.find.outputs.pr_title }}
       is_merge:  ${{ steps.find.outputs.is_merge }}
+      pr_head_ref:   ${{ steps.find.outputs.pr_head_ref }}
+      pr_head_sha:   ${{ steps.find.outputs.pr_head_sha }}
+      pr_head_owner: ${{ steps.find.outputs.pr_head_owner }}
+      pr_head_repo:  ${{ steps.find.outputs.pr_head_repo }}
     steps:
       - name: Find PR associated with this commit
         id: find
@@ -47,6 +51,12 @@ jobs:
             core.setOutput('pr_number', String(pr.number));
             core.setOutput('pr_title',  pr.title || '');
             core.setOutput('is_merge',  merged ? 'true' : 'false');
+            // Export head details (used by promote-feature-branch)
+            const head = prFull.data.head || {};
+            core.setOutput('pr_head_ref',   head.ref   || '');
+            core.setOutput('pr_head_sha',   head.sha   || '');
+            core.setOutput('pr_head_owner', head.repo?.owner?.login || '');
+            core.setOutput('pr_head_repo',  head.repo?.name || '');
             if (!merged) core.info(`PR #${pr.number} is closed but not merged; skipping.`);
   promote-feature-branch:
     name: Promote feature branch -> release branch
@@ -54,6 +64,12 @@ jobs:
     env:
       # This is a placeholder for the validation org URL.
       SF_LOGIN_URL_PROD: "https://test.salesforce.com"
+      PR_NUMBER:     ${{ needs.guard-and-context.outputs.pr_number }}
+      PR_TITLE:      ${{ needs.guard-and-context.outputs.pr_title }}
+      PR_HEAD_REF:   ${{ needs.guard-and-context.outputs.pr_head_ref }}
+      PR_HEAD_SHA:   ${{ needs.guard-and-context.outputs.pr_head_sha }}
+      PR_HEAD_OWNER: ${{ needs.guard-and-context.outputs.pr_head_owner }}
+      PR_HEAD_REPO:  ${{ needs.guard-and-context.outputs.pr_head_repo }}
     if: ${{ needs.guard-and-context.outputs.is_merge }}
     runs-on: ubuntu-latest
     outputs:
