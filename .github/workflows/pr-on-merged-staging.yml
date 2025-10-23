@@ -356,6 +356,8 @@ jobs:
       pull-requests: write
     with:
       ref: ${{ needs.promote-feature-branch.outputs.release_branch }}
+      pr_number: ${{ needs.promote-feature-branch.outputs.release_pr_number }}
+
 
   # Flip analyzer status to success/failure and point at analyzer’s own PR comment if present
   code-analyzer-status-final:
