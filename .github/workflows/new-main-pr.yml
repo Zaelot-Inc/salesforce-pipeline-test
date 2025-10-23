@@ -300,6 +300,8 @@ jobs:
       - name: Can we push to this PR branch?
         id: canpush
         if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
+        env:
+          nochanges: ${{ steps.delta.outputs.no_changes }}
         uses: actions/github-script@v7
         with:
           script: |
@@ -324,7 +326,7 @@ jobs:
             console.log('head Repo ' + headRepoFull);
             const sameRepo = headRepoFull === `${owner}/${repo}`.toLowerCase();
             console.log('Same Repo '+sameRepo);
-            console.log('NoChanges ' + steps.delta.outputs.no_changes);
+            console.log('NoChanges ' + process.env.nochanges);
 
       - name: Commit manifests into the PR branch
         if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true' && steps.canpush.outputs.same_repo == 'true'
