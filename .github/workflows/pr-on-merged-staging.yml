@@ -399,10 +399,10 @@ jobs:
       pr_number: ${{ needs.promote-feature-branch.outputs.release_pr_number }}
 
   # Optionally run your manifest/validation reusable workflow after creating PR
-  run-new-pr-to-main:
+  run-create-manifest-main:
     needs: [promote-feature-branch, guard-and-context]
     if: ${{ needs.guard-and-context.outputs.is_merge == 'true' }}
-    uses: ./.github/workflows/new-main-pr.yml
+    uses: ./.github/workflows/create-manifest-files-main.yml
     permissions:
       contents: write
       pull-requests: write
