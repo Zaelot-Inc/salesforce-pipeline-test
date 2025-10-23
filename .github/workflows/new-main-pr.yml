@@ -110,36 +110,76 @@ jobs:
           distribution: 'zulu'
 
       # Prefer the "PR merge" ref (what will land); fallback to PR head if merge ref isn't available.
-      - name: Prepare refs (origin/main + PR merge, with fallback to head)
-        if: steps.touched.outputs.has_force_app == 'true'
+      - name: Prepare refs (origin/main + target)
+        id: refs
         shell: bash
         env:
-          PR_NUM:   ${{ github.event.pull_request.number }}
           GH_REPO:  ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IS_WF_CALL: ${{ inputs.ref != '' || inputs.pr_number != '' }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_PR:  ${{ inputs.pr_number }}
+          PR_NUM:    ${{ github.event.pull_request.number || inputs.pr_number || '' }}
         run: |
           set -euo pipefail
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git"
-          git fetch --no-tags origin main:refs/remotes/origin/main
-          git rev-parse --verify refs/remotes/origin/main
 
-          if [ "${{ github.event_name }}" = "workflow_call" ]; then
-            # Reusable call: TO_REF is exactly what the caller provided
-            TO_REF='${{ inputs.ref }}'
-            echo "Using TO_REF from workflow_call: ${TO_REF}"
-          else
-            # PR run: fetch the PR merge ref (fallback to head if no merge ref)
-            PR_NUM='${{ github.event.pull_request.number }}'
-            git fetch --no-tags origin main:refs/remotes/origin/main
-            if git fetch --no-tags origin "refs/pull/${PR_NUM}/merge:refs/remotes/origin/pr-${PR_NUM}-merge"; then
-              TO_REF="refs/remotes/origin/pr-${PR_NUM}-merge"
-              echo "Using PR merge ref."
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git"
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git rev-parse --verify refs/remotes/origin/main >/dev/null
+
+          to_ref=""
+
+          if [ "${IS_WF_CALL}" = "true" ]; then
+            # Reusable workflow path: resolve INPUT_REF (branch name or SHA)
+            REF="${INPUT_REF}"
+
+            if [ -z "${REF}" ]; then
+              echo "::error::inputs.ref is empty for workflow_call"; exit 1
+            fi
+
+            # Try to fetch as a branch first
+            if git ls-remote --exit-code --heads origin "refs/heads/${REF}" >/dev/null 2>&1; then
+              git fetch --no-tags origin "refs/heads/${REF}:refs/remotes/target/${REF}"
+              to_ref="refs/remotes/target/${REF}"
+              echo "Using target ref as branch: ${to_ref}"
+            # Try PR head (if REF looks like a PR number)
+            elif [[ "${REF}" =~ ^[0-9]+$ ]] && git ls-remote --exit-code origin "refs/pull/${REF}/head" >/dev/null 2>&1; then
+              git fetch --no-tags origin "refs/pull/${REF}/head:refs/remotes/target/pr-${REF}-head"
+              to_ref="refs/remotes/target/pr-${REF}-head"
+              echo "Using target ref as PR head: ${to_ref}"
+            # Try as a commit SHA
+            elif [[ "${REF}" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+              # Ensure the SHA exists locally
+              if ! git cat-file -e "${REF}^{commit}" 2>/dev/null; then
+                # Fetch the SHA by mirroring all refs (shallow); harmless and quick
+                git fetch --no-tags --depth=50 origin "+${REF}:${REF}" || true
+              fi
+              to_ref="${REF}"
+              echo "Using target ref as commit: ${to_ref}"
             else
-              git fetch --no-tags origin "refs/pull/${PR_NUM}/head:refs/remotes/origin/pr-${PR_NUM}-head"
-              TO_REF="refs/remotes/origin/pr-${PR_NUM}-head"
-              echo "PR not mergeable; using head ref."
+              echo "::error::Could not resolve inputs.ref='${REF}' as branch, PR number, or commit SHA"
+              exit 1
+            fi
+
+          else
+            # PR trigger path: fetch PR merge ref, fallback to head
+            PR="${PR_NUM}"
+
+            if ! [[ "${PR}" =~ ^[0-9]+$ ]]; then
+              echo "::error::PR number is empty/invalid in PR path ('${PR}')"; exit 1
+            fi
+
+            if git fetch --no-tags origin "refs/pull/${PR}/merge:refs/remotes/origin/pr-${PR}-merge" 2>/dev/null; then
+              to_ref="refs/remotes/origin/pr-${PR}-merge"
+              echo "Using PR merge ref: ${to_ref}"
+            else
+              git fetch --no-tags origin "refs/pull/${PR}/head:refs/remotes/origin/pr-${PR}-head"
+              to_ref="refs/remotes/origin/pr-${PR}-head"
+              echo "Using PR head ref: ${to_ref}"
             fi
           fi
+
+          echo "to_ref=${to_ref}" >> "$GITHUB_OUTPUT"
 
 
       - name: Generate delta (origin/main -> $TO_REF)
