@@ -83,7 +83,7 @@ jobs:
       PR_HEAD_OWNER: ${{ needs.guard-and-context.outputs.pr_head_owner }}
       PR_HEAD_REPO:  ${{ needs.guard-and-context.outputs.pr_head_repo }}
     outputs:
-      release_branch: ${{ steps.create_branch.outputs.release_branch }}
+      release_branch: ${{ steps.build_release.outputs.release_branch }}
       release_pr_number: ${{ steps.open_pr.outputs.release_pr_number }}
     steps:
       # Step 1: Checkout
@@ -319,12 +319,13 @@ jobs:
             const title = `[release] Promote PR #${process.env.SRC_PR_NUM} -> main: ${process.env.SRC_PR_TITLE}`;
             const body  = `Automated release PR to promote feature from merged staging PR #${process.env.SRC_PR_NUM}.`;
             const { data: pr } = await github.rest.pulls.create({ owner, repo, head: branch, base, title, body });
+            core.setOutput("release_branch_created", pr.number !== '');
             core.setOutput("release_pr_number", pr.number.toString());
             core.setOutput("release_pr_url", pr.html_url);
 
 
       - name: Comment on original staging PR about release PR
-        if: steps.gen_delta.outputs.no_changes == 'false' && always() && steps.open_pr.outputs.release_pr_number
+        if:  steps.open_pr.outputs.release_branch_created
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
