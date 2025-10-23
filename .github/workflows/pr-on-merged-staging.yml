@@ -428,7 +428,7 @@ jobs:
             echo "desc=Code Analyzer failed (${RES})" >> $GITHUB_OUTPUT
           fi
 
-      - name: Find analyzer PR comment URL (robust, repo-level head_sha filter)
+      - name: Find analyzer PR comment URL (by commit date, no Actions lookup)
         id: find_comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -438,28 +438,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 1) Find the analyzer workflow run for this SHA by scanning repo runs,
-          #    then filtering by workflow file path.
-          RUN_JSON="$(gh api "repos/${REPO}/actions/runs" \
-            -f head_sha="${SHA}" --paginate \
-            --jq '[ .workflow_runs[]
-                    | select(.path == ".github/workflows/code-analyzer.yml") ]
-                  | sort_by(.created_at) | last // empty')"
-
-          if [ -n "$RUN_JSON" ] && [ "$RUN_JSON" != "null" ]; then
-            RUN_CREATED="$(jq -r '.created_at' <<<"$RUN_JSON")"
-            RUN_URL="$(jq -r '.html_url'    <<<"$RUN_JSON")"
+          # 1) Get the PR head commit timestamp; use it as a lower bound
+          COMMIT_DATE="$(gh api "repos/${REPO}/commits/${SHA}" --jq '.commit.committer.date' || true)"
+          if [ -z "${COMMIT_DATE:-}" ] || [ "${COMMIT_DATE}" = "null" ]; then
+            SINCE="$(date -u -d "2 days ago" +"%Y-%m-%dT%H:%M:%SZ")"
           else
-            # Fallback if we can’t find a matching run; use a recent time window and current workflow URL
-            RUN_CREATED="$(date -u -d "1 day ago" +"%Y-%m-%dT%H:%M:%SZ")"
-            RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            SINCE="${COMMIT_DATE}"
           fi
 
-          # 2) Collect PR comments since the run started (issue + review)
-          ISSUE_COMMENTS="$(gh api "repos/${REPO}/issues/${PR}/comments" -f since="$RUN_CREATED" --paginate || true)"
-          REVIEW_COMMENTS="$(gh api "repos/${REPO}/pulls/${PR}/comments" -f since="$RUN_CREATED" --paginate || true)"
+          # 2) Fetch issue and review comments since that time
+          ISSUE_COMMENTS="$(gh api "repos/${REPO}/issues/${PR}/comments" -f since="$SINCE" --paginate || true)"
+          REVIEW_COMMENTS="$(gh api "repos/${REPO}/pulls/${PR}/comments"  -f since="$SINCE" --paginate || true)"
 
-          # 3) Prefer bot comment URL; else fall back to the run URL
+          # 3) Prefer the most recent github-actions[bot] comment; fall back to the PR URL
           BOT="github-actions[bot]"
           ISSUE_URL="$(jq -r --arg BOT "$BOT" \
             '[ .[] | select(.user.login == $BOT) ] | sort_by(.created_at) | last | .html_url // empty' \
@@ -473,10 +464,11 @@ jobs:
           elif [ -n "${REVIEW_URL:-}" ]; then
             URL="$REVIEW_URL"
           else
-            URL="$RUN_URL"
+            URL="${{ github.server_url }}/${{ github.repository }}/pull/${PR}"
           fi
 
           echo "url=$URL" >> "$GITHUB_OUTPUT"
+
 
 
       - name: Set commit status success/failure (code-analyzer)
