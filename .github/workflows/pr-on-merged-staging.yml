@@ -428,54 +428,56 @@ jobs:
             echo "desc=Code Analyzer failed (${RES})" >> $GITHUB_OUTPUT
           fi
 
-      - name: Find analyzer PR comment URL (robust)
+      - name: Find analyzer PR comment URL (robust, repo-level head_sha filter)
         id: find_comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          PR: ${{ needs.code-analyzer-status-pending.outputs.pr_number }}
-          SHA: ${{ needs.code-analyzer-status-pending.outputs.analysis_sha }}
+          PR:   ${{ needs.code-analyzer-status-pending.outputs.pr_number }}
+          SHA:  ${{ needs.code-analyzer-status-pending.outputs.analysis_sha }}
         run: |
           set -euo pipefail
 
-          # 1) Find the analyzer workflow run for this SHA (event=workflow_call)
-          RUN_JSON=$(gh api \
-            repos/$REPO/actions/workflows/code-analyzer.yml/runs \
-            -f head_sha="$SHA" -f event=workflow_call \
-            --jq '.workflow_runs | sort_by(.created_at) | last // empty')
+          # 1) Find the analyzer workflow run for this SHA by scanning repo runs,
+          #    then filtering by workflow file path.
+          RUN_JSON="$(gh api "repos/${REPO}/actions/runs" \
+            -f head_sha="${SHA}" --paginate \
+            --jq '[ .workflow_runs[]
+                    | select(.path == ".github/workflows/code-analyzer.yml") ]
+                  | sort_by(.created_at) | last // empty')"
 
           if [ -n "$RUN_JSON" ] && [ "$RUN_JSON" != "null" ]; then
-            RUN_ID=$(jq -r '.id' <<<"$RUN_JSON")
-            RUN_CREATED=$(jq -r '.created_at' <<<"$RUN_JSON")
-            RUN_URL=$(jq -r '.html_url' <<<"$RUN_JSON")
+            RUN_CREATED="$(jq -r '.created_at' <<<"$RUN_JSON")"
+            RUN_URL="$(jq -r '.html_url'    <<<"$RUN_JSON")"
           else
-            RUN_ID=""
-            RUN_CREATED=$(date -u -d "1 day ago" +"%Y-%m-%dT%H:%M:%SZ")
+            # Fallback if we can’t find a matching run; use a recent time window and current workflow URL
+            RUN_CREATED="$(date -u -d "1 day ago" +"%Y-%m-%dT%H:%M:%SZ")"
             RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           fi
 
           # 2) Collect PR comments since the run started (issue + review)
-          ISSUE_COMMENTS=$(gh api repos/$REPO/issues/$PR/comments -f since="$RUN_CREATED" --paginate)
-          REVIEW_COMMENTS=$(gh api repos/$REPO/pulls/$PR/comments -f since="$RUN_CREATED" --paginate)
+          ISSUE_COMMENTS="$(gh api "repos/${REPO}/issues/${PR}/comments" -f since="$RUN_CREATED" --paginate || true)"
+          REVIEW_COMMENTS="$(gh api "repos/${REPO}/pulls/${PR}/comments" -f since="$RUN_CREATED" --paginate || true)"
 
-          # 3) Filter to bot comments (most analyzers comment as github-actions[bot])
+          # 3) Prefer bot comment URL; else fall back to the run URL
           BOT="github-actions[bot]"
-          ISSUE_URL=$(jq -r --arg BOT "$BOT" \
+          ISSUE_URL="$(jq -r --arg BOT "$BOT" \
             '[ .[] | select(.user.login == $BOT) ] | sort_by(.created_at) | last | .html_url // empty' \
-            <<<"$ISSUE_COMMENTS")
-          REVIEW_URL=$(jq -r --arg BOT "$BOT" \
+            <<<"$ISSUE_COMMENTS")"
+          REVIEW_URL="$(jq -r --arg BOT "$BOT" \
             '[ .[] | select(.user.login == $BOT) ] | sort_by(.created_at) | last | .html_url // empty' \
-            <<<"$REVIEW_COMMENTS")
+            <<<"$REVIEW_COMMENTS")"
 
-          if [ -n "$ISSUE_URL" ]; then
+          if [ -n "${ISSUE_URL:-}" ]; then
             URL="$ISSUE_URL"
-          elif [ -n "$REVIEW_URL" ]; then
+          elif [ -n "${REVIEW_URL:-}" ]; then
             URL="$REVIEW_URL"
           else
             URL="$RUN_URL"
           fi
 
           echo "url=$URL" >> "$GITHUB_OUTPUT"
+
 
       - name: Set commit status success/failure (code-analyzer)
         env:
