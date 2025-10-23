@@ -321,7 +321,10 @@ jobs:
             });
 
             const headRepoFull = (pr.head?.repo?.full_name || '').toLowerCase();
+            console.log('head Repo ' + headRepoFull);
             const sameRepo = headRepoFull === `${owner}/${repo}`.toLowerCase();
+            console.log('Same Repo '+sameRepo);
+            console.log('NoChanges ' + steps.delta.outputs.no_changes);
 
       - name: Commit manifests into the PR branch
         if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true' && steps.canpush.outputs.same_repo == 'true'
