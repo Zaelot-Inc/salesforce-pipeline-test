@@ -1,7 +1,5 @@
 name: Generate deploy manifests + PR instructions (no auto validation)
-
 on:
-  
   pull_request:
     branches: [ main ]
     types: [ opened, reopened, synchronize, ready_for_review ]
@@ -25,7 +23,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: 'main-pr-manifests-${{ github.event.pull_request.number }}'
+  group: main-pr-manifests-${{ github.event.pull_request.number || inputs.pr_number || inputs.ref || github.sha }}
   cancel-in-progress: true
 
 jobs:
@@ -51,22 +49,28 @@ jobs:
           echo "PR_HEAD_REF=${{ inputs.ref }}" >> $GITHUB_ENV
           echo "PR_HEAD_SHA=${{ inputs.ref }}" >> $GITHUB_ENV
 
+      - name: Set PR context (pull_request)
+        if: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          echo "PR_NUM=${{ github.event.pull_request.number || '0' }}" >> $GITHUB_ENV
+          echo "PR_TITLE=${{ github.event.pull_request.title || 'Release validation (pull_request)' }}" >> $GITHUB_ENV
+          echo "PR_HEAD_REF=${{ github.event.pull_request.head.ref }}" >> $GITHUB_ENV
+          echo "PR_HEAD_SHA=${{ github.event.pull_request.head.sha }}" >> $GITHUB_ENV
 
       # Quick guard: does the PR touch force-app at all?
       - name: Detect force-app changes
         id: touched
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const number = context.payload.pull_request.number;
-            const files = await github.paginate(
-              github.rest.pulls.listFiles,
-              { owner, repo, pull_number: number, per_page: 100 }
-            );
-            const hasForceApp = files.some(f => f.filename.startsWith('force-app/'));
-            core.setOutput('has_force_app', hasForceApp ? 'true' : 'false');
+        shell: bash  
+        run: |
+            set -euo pipefail
+            FROM=origin/main
+            TO="${{ env.PR_HEAD_REF }}"
+            if git diff --name-only --diff-filter=ACDMR "$FROM" "$TO" -- 'force-app/**' | grep -q .; then
+              echo "has_force_app=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "has_force_app=false" >> "$GITHUB_OUTPUT"
+            fi
 
       # If NO force-app changes at all, exit gracefully
       - name: No force-app changes (success)
@@ -77,7 +81,7 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
+              issue_number: Number(process.env.PR_NUM),
               body: "ℹ️ Skipping manifest generation: this PR does not touch `force-app/**`."
             });
 
@@ -128,6 +132,7 @@ jobs:
               echo "PR not mergeable; using head ref."
             fi
           fi
+
 
       - name: Generate delta (origin/main -> $TO_REF)
         if: steps.touched.outputs.has_force_app == 'true'
@@ -186,12 +191,13 @@ jobs:
         with:
           script: |
             const {owner, repo} = context.repo;
-            const number = context.payload.pull_request.number;
+            const number = Number(process.env.PR_NUM);
             await github.rest.issues.createComment({
               owner, repo, issue_number: number,
               body: "ℹ️ No delta found between `main` and this PR — no manifests generated."
             });
 
+          
       - name: Build branch-safe name + output paths
         if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
         id: naming
@@ -246,8 +252,25 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const sameRepo = context.payload.pull_request.head.repo?.full_name === context.repo.owner + '/' + context.repo.repo;
-            core.setOutput('same_repo', sameRepo ? 'true' : 'false');
+            const { owner, repo } = context.repo;
+            const prNumber =
+              Number(process.env.PR_NUM || context.payload?.pull_request?.number || 0);
+
+            if (!prNumber) {
+              core.info('No PR number available; cannot determine push permissions.');
+              core.setOutput('same_repo', 'false');
+              core.setOutput('head_ref', '');
+              core.setOutput('head_owner', '');
+              core.setOutput('head_repo', '');
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner, repo, pull_number: prNumber
+            });
+
+            const headRepoFull = (pr.head?.repo?.full_name || '').toLowerCase();
+            const sameRepo = headRepoFull === `${owner}/${repo}`.toLowerCase();
 
       - name: Commit manifests into the PR branch
         if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true' && steps.canpush.outputs.same_repo == 'true'
@@ -263,8 +286,8 @@ jobs:
             echo "Manifests unchanged; nothing to commit."
             exit 0
           fi
-          git commit -m "chore(manifest): generate delta manifests for PR #${{ github.event.pull_request.number }}"
-          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+          git commit -m "chore(manifest): generate delta manifests for PR #:${{ env.PR_NUM }}"
+          git push origin "HEAD:${ process.env.PR_HEAD_REF }"
 
       - name: Upload manifests as artifact (fork PRs / no push)
         if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true' && steps.canpush.outputs.same_repo != 'true'
@@ -274,6 +297,8 @@ jobs:
           path: |
             ${{ steps.naming.outputs.pkg_path }}
             ${{ steps.naming.outputs.dest_path }}
+          if-no-files-found: ignore
+
       - name: Comment instructions on the PR
         if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true'
         uses: actions/github-script@v7
@@ -281,7 +306,7 @@ jobs:
           script: |
             const fs = require('fs');
             const { owner, repo } = context.repo;
-            const number = context.payload.pull_request.number;
+            const number = Number(process.env.PR_NUM);
 
             // Get all your variables from previous steps
             const branch = "${{ steps.naming.outputs.branch_safe }}";
@@ -308,6 +333,7 @@ jobs:
               body = removeBlock('IF_DESTRUCTIVE', body);
             }
             
+
             if (canPush) {
               // It's a same-repo PR, so remove the "fork" message
               body = removeBlock('IF_FORK_PR', body);
