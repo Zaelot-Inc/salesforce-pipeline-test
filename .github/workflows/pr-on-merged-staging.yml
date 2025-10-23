@@ -395,6 +395,7 @@ jobs:
       contents: read
     with:
       ref: ${{ needs.promote-feature-branch.outputs.release_branch }}
+      pr_number: ${{ needs.guard-and-context.outputs.pr_number }}
 
   # Optionally run your manifest/validation reusable workflow after creating PR
   run-new-pr-to-main:

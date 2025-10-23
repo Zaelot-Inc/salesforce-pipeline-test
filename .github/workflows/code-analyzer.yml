@@ -15,7 +15,6 @@ on:
         type: string
       created_by_workflow:
         description: "Indicate the job call was created through a workflow"
-        required: true
         type: boolean
         default: true
 
