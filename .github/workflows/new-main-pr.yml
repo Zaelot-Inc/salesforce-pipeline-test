@@ -341,13 +341,13 @@ jobs:
             exit 0
           fi
           git commit -m "chore(manifest): generate delta manifests for PR #:${{ env.PR_NUM }}"
-          git push origin "HEAD:${ process.env.PR_HEAD_REF }"
+          git push origin "HEAD:${{ env.PR_HEAD_REF }}"
 
       - name: Upload manifests as artifact (fork PRs / no push)
         if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true' && steps.canpush.outputs.same_repo != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: pr-${{ github.event.pull_request.number }}-manifests
+          name: pr-${{ github.event.pull_request.number || inputs.pr_number}}-manifests
           path: |
             ${{ steps.naming.outputs.pkg_path }}
             ${{ steps.naming.outputs.dest_path }}
