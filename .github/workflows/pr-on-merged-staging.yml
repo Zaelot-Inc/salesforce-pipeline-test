@@ -342,16 +342,30 @@ jobs:
       analysis_sha: ${{ steps.get.outputs.sha }}
       pr_number: ${{ steps.get.outputs.pr }}
     steps:
-      - name: Resolve PR + head SHA
+      - name: Resolve PR + head SHA (no local git needed)
         id: get
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR: ${{ needs.promote-feature-branch.outputs.release_pr_number }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          SHA=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "pr=$PR"   >> "$GITHUB_OUTPUT"
+
+          if [ -z "${PR:-}" ] || ! [[ "$PR" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid PR number: '${PR:-<empty>}'"
+            exit 1
+          fi
+
+          # Use GitHub API via gh (explicit repo) to avoid .git dependency
+          SHA="$(gh api "repos/${REPO}/pulls/${PR}" --jq '.head.sha')"
+          if [ -z "${SHA:-}" ] || [ "${SHA}" = "null" ]; then
+            echo "::error::Could not resolve head SHA for PR #${PR}"
+            exit 1
+          fi
+
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "pr=${PR}"   >> "$GITHUB_OUTPUT"
+
 
       - name: Set commit status pending (code-analyzer)
         env:
