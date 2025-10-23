@@ -428,47 +428,38 @@ jobs:
             echo "desc=Code Analyzer failed (${RES})" >> $GITHUB_OUTPUT
           fi
 
-      - name: Find analyzer PR comment URL (by commit date, no Actions lookup)
+      - name: Find analyzer PR comment URL (no Actions lookup, robust pagination)
         id: find_comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR:   ${{ needs.code-analyzer-status-pending.outputs.pr_number }}
-          SHA:  ${{ needs.code-analyzer-status-pending.outputs.analysis_sha }}
         run: |
           set -euo pipefail
 
-          # 1) Get the PR head commit timestamp; use it as a lower bound
-          COMMIT_DATE="$(gh api "repos/${REPO}/commits/${SHA}" --jq '.commit.committer.date' || true)"
-          if [ -z "${COMMIT_DATE:-}" ] || [ "${COMMIT_DATE}" = "null" ]; then
-            SINCE="$(date -u -d "2 days ago" +"%Y-%m-%dT%H:%M:%SZ")"
-          else
-            SINCE="${COMMIT_DATE}"
-          fi
+          # 1) Fetch *all* issue comments and review comments for this PR (no 'since' param)
+          ISSUE_JSON="$(gh api "repos/${REPO}/issues/${PR}/comments" --paginate || true)"
+          REVIEW_JSON="$(gh api "repos/${REPO}/pulls/${PR}/comments"  --paginate || true)"
 
-          # 2) Fetch issue and review comments since that time
-          ISSUE_COMMENTS="$(gh api "repos/${REPO}/issues/${PR}/comments" -f since="$SINCE" --paginate || true)"
-          REVIEW_COMMENTS="$(gh api "repos/${REPO}/pulls/${PR}/comments"  -f since="$SINCE" --paginate || true)"
+          # 2) Combine paginated arrays and pick the most recent github-actions[bot] comment, if any
+          ISSUE_URL="$(printf '%s\n' "$ISSUE_JSON" \
+            | jq -s -r '[ .[] | .[] | select(.user.login=="github-actions[bot]") ]
+                        | sort_by(.created_at) | last | .html_url // empty')"
 
-          # 3) Prefer the most recent github-actions[bot] comment; fall back to the PR URL
-          BOT="github-actions[bot]"
-          ISSUE_URL="$(jq -r --arg BOT "$BOT" \
-            '[ .[] | select(.user.login == $BOT) ] | sort_by(.created_at) | last | .html_url // empty' \
-            <<<"$ISSUE_COMMENTS")"
-          REVIEW_URL="$(jq -r --arg BOT "$BOT" \
-            '[ .[] | select(.user.login == $BOT) ] | sort_by(.created_at) | last | .html_url // empty' \
-            <<<"$REVIEW_COMMENTS")"
+          REVIEW_URL="$(printf '%s\n' "$REVIEW_JSON" \
+            | jq -s -r '[ .[] | .[] | select(.user.login=="github-actions[bot]") ]
+                        | sort_by(.created_at) | last | .html_url // empty')"
 
           if [ -n "${ISSUE_URL:-}" ]; then
             URL="$ISSUE_URL"
           elif [ -n "${REVIEW_URL:-}" ]; then
             URL="$REVIEW_URL"
           else
+            # Fallback: point to the PR if no bot comment is found
             URL="${{ github.server_url }}/${{ github.repository }}/pull/${PR}"
           fi
 
           echo "url=$URL" >> "$GITHUB_OUTPUT"
-
 
 
       - name: Set commit status success/failure (code-analyzer)
