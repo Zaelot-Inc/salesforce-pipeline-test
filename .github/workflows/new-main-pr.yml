@@ -25,6 +25,8 @@ permissions:
 concurrency:
   group: main-pr-manifests-${{ github.event.pull_request.number || inputs.pr_number || inputs.ref || github.sha }}
   cancel-in-progress: true
+env:
+  IS_WF_CALL: ${{ inputs.ref != '' || inputs.pr_number != '' }}
 
 jobs:
   build-manifests-and-comment:
@@ -41,7 +43,7 @@ jobs:
 
     # If invoked via workflow_call, synthesize PR context for downstream steps
       - name: Set PR context (workflow_call)
-        if: ${{ github.event_name == 'workflow_call' }}
+        if: ${{ env.IS_WF_CALL }}
         shell: bash
         run: |
           echo "PR_NUM=${{ inputs.pr_number || '0' }}" >> $GITHUB_ENV
@@ -50,7 +52,7 @@ jobs:
           echo "PR_HEAD_SHA=${{ inputs.ref }}" >> $GITHUB_ENV
 
       - name: Set PR context (pull_request)
-        if: ${{ github.event_name == 'pull_request' }}
+        if: ${{ !env.IS_WF_CALL }}
         shell: bash
         run: |
           echo "PR_NUM=${{ github.event.pull_request.number || '0' }}" >> $GITHUB_ENV
