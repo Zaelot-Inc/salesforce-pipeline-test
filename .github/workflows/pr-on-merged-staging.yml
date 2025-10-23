@@ -178,7 +178,7 @@ jobs:
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global user.name  "github-actions[bot]"
 
-      - name: Cherry-pick PR commits (preserve history, filter workflows, handle conflicts & empty picks)
+      - name: Cherry-pick PR commits (filter workflows, handle conflicts & empty picks)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -197,7 +197,6 @@ jobs:
             echo "::error::Release branch ${REL_BRANCH} not found."; exit 1
           fi
 
-          # Get all commits from the source PR (oldest → newest)
           mapfile -t COMMITS < <(gh api "repos/${REPO}/pulls/${SRC_PR_NUM}/commits" --paginate --jq '.[].sha')
           if [ "${#COMMITS[@]}" -eq 0 ]; then
             echo "::error::PR #${SRC_PR_NUM} has no commits."; exit 1
@@ -216,7 +215,7 @@ jobs:
             gh pr comment "${PR}" --repo "${REPO}" --body "$BODY" || true
           }
 
-          # Helper: strip workflow files from the index/worktree
+          # Strip any .github/workflows/* changes (no workflows permission)
           strip_workflows () {
             git restore --staged --worktree -- .github/workflows || true
             CHANGED=$(git diff --name-only --cached | grep -E '(^|/)\.github/workflows(/|$)' || true)
@@ -227,6 +226,18 @@ jobs:
             fi
           }
 
+          # Helper: if in cherry-pick state and index is empty → skip this commit
+          skip_if_empty () {
+            if [ -f .git/CHERRY_PICK_HEAD ] || [ -d .git/sequencer ]; then
+              if git diff --cached --quiet && git diff --quiet; then
+                echo "Empty cherry-pick detected → skipping"
+                git cherry-pick --skip || true
+                return 0
+              fi
+            fi
+            return 1
+          }
+
           for sha in "${COMMITS[@]}"; do
             # Skip if already in main
             if git merge-base --is-ancestor "$sha" origin/main; then
@@ -234,17 +245,16 @@ jobs:
             fi
 
             echo "::group::Cherry-picking $sha (no-commit)"
-            # 1) Apply without committing (-n) so we can filter paths
+            # First attempt: apply without committing so we can filter
             if git cherry-pick -x -n "$sha"; then
               :
             else
-              # On failure, check if it's a real conflict or an "empty after resolution" scenario
+              # If there are conflict markers, try one retry favoring PR hunks
               if git diff --name-only --diff-filter=U | grep -q .; then
-                # Real conflicts present: try one retry preferring PR hunks
                 echo "Conflict on $sha — retry with -Xtheirs"
                 git cherry-pick --abort >/dev/null 2>&1 || true
                 if ! git cherry-pick -x -n -Xtheirs "$sha"; then
-                  # Still conflicts → report and fail
+                  # Still conflicted → report and fail
                   CONFLICTS="$(git diff --name-only --diff-filter=U || true)"
                   git cherry-pick --abort || true
                   echo "::error::Unresolved conflicts on $sha"
@@ -254,33 +264,31 @@ jobs:
                   exit 1
                 fi
               else
-                # No conflict markers; Git likely complained "previous cherry-pick is now empty"
-                # Treat as already-applied: abort any state and skip
-                git cherry-pick --abort >/dev/null 2>&1 || true
+                # No U-files → Git says it's empty after resolution → skip this pick
+                git cherry-pick --skip || true
                 echo "Empty after resolution; treating $sha as already applied. Skipping."
                 echo "::endgroup::"
                 continue
               fi
             fi
 
-            # 2) Strip workflow-file edits before committing (no workflows permission)
+            # Remove workflow changes before committing
             strip_workflows
 
-            # 3) If nothing remains after filtering, drop and continue
-            if git diff --cached --quiet; then
-              echo "No non-workflow changes in $sha after filtering; skipping commit"
-              git reset --hard
+            # If, after filtering, nothing remains, skip this cherry-pick cleanly
+            if skip_if_empty; then
               echo "::endgroup::"
               continue
             fi
 
-            # 4) Commit staged changes with original message (-x already appended)
-            git commit --no-edit --allow-empty
+            # Commit staged changes with original message (-x trailer already added)
+            git commit --no-edit
             echo "::endgroup::"
           done
 
-          # Push after all cherry-picks; only non-workflow changes will be included
+          # Push after all cherry-picks
           git push origin "HEAD:${REL_BRANCH}"
+
 
 
       # Step 6: Open PR release → main (idempotent)
