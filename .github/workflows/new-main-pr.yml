@@ -186,6 +186,9 @@ jobs:
         if: steps.touched.outputs.has_force_app == 'true'
         id: delta
         shell: bash
+        env:
+          TO_REF: ${{ steps.refs.outputs.to_ref }}   # <- bring the output into this step
+
         run: |
           set -euo pipefail # This 'set -e' is the source of the problem
           rm -rf changed-sources
