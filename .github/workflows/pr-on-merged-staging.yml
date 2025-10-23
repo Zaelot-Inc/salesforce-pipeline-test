@@ -275,7 +275,7 @@ jobs:
             fi
 
             # 4) Commit staged changes with original message (-x already appended)
-            git commit --no-edit
+            git commit --no-edit --allow-empty
             echo "::endgroup::"
           done
 
