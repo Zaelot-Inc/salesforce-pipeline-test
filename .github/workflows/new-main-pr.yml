@@ -255,7 +255,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          RAW="${{ github.event.pull_request.head.ref }}"
+          RAW="${{ github.event.pull_request.head.ref || inputs.pr_head_ref }}"
           SAFE="$(printf "%s" "$RAW" | sed -E 's/[^A-Za-z0-9._-]+/-/g')"
           PKG="manifest/branch/${SAFE}-package.xml"
           DEST="manifest/branch/${SAFE}-package-destructive.xml"
@@ -323,10 +323,8 @@ jobs:
             });
 
             const headRepoFull = (pr.head?.repo?.full_name || '').toLowerCase();
-            console.log('head Repo ' + headRepoFull);
             const sameRepo = headRepoFull === `${owner}/${repo}`.toLowerCase();
-            console.log('Same Repo '+sameRepo);
-            console.log('NoChanges ' + process.env.nochanges);
+            core.setOutput('same_repo', sameRepo);
 
       - name: Commit manifests into the PR branch
         if: steps.touched.outputs.has_force_app == 'true' && steps.delta.outputs.no_changes != 'true' && steps.canpush.outputs.same_repo == 'true'
